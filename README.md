@@ -1,6 +1,6 @@
 <h1 align="center">
   <!-- <img src="assets/logo.png" width="50" style="vertical-align: middle;"/> -->
- Taming Data and Transformers for Audio Generation
+ [IJCV] Taming Data and Transformers for Audio Generation
 </h1>
 
 ### 🚀 Check Out Our Latest Work! 🎥🔊  
@@ -18,7 +18,7 @@ This is the official GitHub repository of the paper Taming Data and Transformers
 [Guha Balakrishnan](https://www.guhabalakrishnan.com),
 [Vicente Ordonez](https://vislang.ai/),
 </br>
-*Arxiv 2024*
+*IJCV*
 
 [![Project Page](https://img.shields.io/badge/Project-Page-green.svg)](https://snap-research.github.io/GenAU) [![Arxiv](https://img.shields.io/badge/arxiv-2406.19388-b31b1b)](https://arxiv.org/abs/2406.19388) [![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/taming-data-and-transformers-for-audio-1/audio-captioning-on-audiocaps)](https://paperswithcode.com/sota/audio-captioning-on-audiocaps?p=taming-data-and-transformers-for-audio-1)[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/taming-data-and-transformers-for-audio-1/audio-generation-on-audiocaps)](https://paperswithcode.com/sota/audio-generation-on-audiocaps?p=taming-data-and-transformers-for-audio-1)
 
@@ -87,10 +87,14 @@ See [GenAU](./GenAU/README.md) README for details on inference, training, finetu
 ## Citation
 If you find this paper useful in your research, please consider citing our work:
 ```
-@article{haji2024taming,
+@article{haji2026taming,
   title={Taming data and transformers for audio generation},
-  author={Haji-Ali, Moayed and Menapace, Willi and Siarohin, Aliaksandr and Balakrishnan, Guha and Tulyakov, Sergey and Ordonez, Vicente},
-  journal={arXiv preprint arXiv:2406.19388},
-  year={2024}
+  author={Haji-Ali, Moayed and Menapace, Willi and Siarohin, Aliaksandr and Balakrishnan, Guha and Ordonez, Vicente},
+  journal={International Journal of Computer Vision},
+  volume={134},
+  number={3},
+  pages={87},
+  year={2026},
+  publisher={Springer}
 }
 ```
