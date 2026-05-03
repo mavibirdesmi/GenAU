@@ -8,20 +8,52 @@ from io import StringIO
 import json
 import argparse
 from functools import partial
+import random
+import time
 from download_manager import get_dataset_json_file, dataset_urls
+
+def wait_global_rate_limit(global_rate_state,
+                           global_rate_lock,
+                           sleep_interval_requests,
+                           sleep_interval,
+                           max_sleep_interval):
+    if global_rate_state is None or global_rate_lock is None:
+        return
+
+    request_gap = max(0.0, float(sleep_interval_requests))
+    interval_min = max(0.0, float(sleep_interval))
+    interval_max = max(interval_min, float(max_sleep_interval))
+    extra_gap = random.uniform(interval_min, interval_max) if interval_max > 0 else 0.0
+    total_gap = request_gap + extra_gap
+
+    while True:
+        with global_rate_lock:
+            now = time.monotonic()
+            next_allowed_ts = global_rate_state.get("next_allowed_ts", 0.0)
+            wait_for = next_allowed_ts - now
+            if wait_for <= 0:
+                global_rate_state["next_allowed_ts"] = now + total_gap
+                return
+        time.sleep(min(wait_for, 0.25))
 
 def download_yt_video(entry,
                     save_dir,
+                    temp_working_dir,
+                    global_rate_state=None,
+                    global_rate_lock=None,
                     yt_cookie_path=None,
                     audio_only=False,
                     proxy=None,
                     audio_sampling_rate=44100,
                     resume=True,
-                    files_per_folder=5000):
-    
+                    files_per_folder=5000,
+                    sleep_interval=10.0,
+                    sleep_interval_subtitles=5.0,
+                    sleep_interval_requests=0.75,
+                    max_sleep_interval=20.0):
     video_idx = entry[0]
     video_id, intervals = entry[1][0], entry[1][1]['intervals']
-    
+
     for file_idx, video_info in enumerate(intervals):
         start = video_info['start']
         to = video_info['end']
@@ -29,25 +61,25 @@ def download_yt_video(entry,
         subfolder_idx = f'{video_idx // files_per_folder:06}'
         st = f'{int(start//3600)}:{int(start//60)-60*int(start//3600)}:{start%60}'
         dur = f'{int(to//3600)}:{int(to//60)-60*int(to//3600)}:{to%60}'
-        
+
         outpath = os.path.join(save_dir, subfolder_idx)
         os.makedirs(outpath, exist_ok=True)
-        
+
         if resume and os.path.isfile(os.path.join(outpath, f'{video_id}_{file_idx:03d}.json')):
             continue
         else:
             ytdl_logger = logging.getLogger()
-            log_stream = StringIO()    
+            log_stream = StringIO()
             logging.basicConfig(stream=log_stream, level=logging.INFO)
-            
+
             out_file_ext = 'wav' if audio_only else 'mp4'
             format = 'bestaudio/best' if audio_only else 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio'
             ydl_opts = {
                 "logger": ytdl_logger,
-                'outtmpl': f"/temps/id_{video_id}_{file_idx:03d}/audio.%(ext)s",
+                'outtmpl': f"{temp_working_dir}/id_{video_id}_{file_idx:03d}/audio.%(ext)s",
                 'format': format,
                 'quiet': True,
-                'ignoreerrors': False, 
+                'ignoreerrors': False,
                 # 'write_thumbnail': True,
                 'writeinfojson': True,  # This will write a separate .info.json with detailed info
                 # 'writesubtitles': True,  # Attempt to download subtitles (transcripts)
@@ -58,9 +90,15 @@ def download_yt_video(entry,
                 'download_ranges': yt_dlp.utils.download_range_func([], [[start, to]]),
                 'force-keyframe-at-cuts': True,
                 'external_downloader_args':['-loglevel', 'quiet'],
+                "remote_components": ["ejs:github"],
+                "cookiesfrombrowser": ("firefox",),
+                "sleep_interval": sleep_interval,
+                "sleep_interval_subtitles": sleep_interval_subtitles,
+                "sleep_interval_requests": sleep_interval_requests,
+                "max_sleep_interval": max_sleep_interval,
             }
             if yt_cookie_path is not None:
-                ydl_opts['cookiefile'] = f'/temps/id_{video_id}_{file_idx:03d}/cookies.txt'
+                ydl_opts['cookiefile'] = f'{temp_working_dir}/id_{video_id}_{file_idx:03d}/cookies.txt'
             if audio_only:
                 ydl_opts['postprocessors'] = [{'key': 'FFmpegExtractAudio',
                                                'preferredcodec': 'wav'}]
@@ -70,27 +108,32 @@ def download_yt_video(entry,
                                                 }]
             if proxy is not None:
                 ydl_opts['proxy'] = f'socks5://127.0.0.1:{proxy}/'
-            
+
             url = f'https://www.youtube.com/watch?v={video_id}'
-            os.makedirs(f'/temps/id_{video_id}_{file_idx:03d}', exist_ok=True)
+            os.makedirs(f'{temp_working_dir}/id_{video_id}_{file_idx:03d}', exist_ok=True)
             if yt_cookie_path is not None:
-                shutil.copy(yt_cookie_path, f'/temps/id_{video_id}_{file_idx:03d}/cookies.txt')
+                shutil.copy(yt_cookie_path, f'{temp_working_dir}/id_{video_id}_{file_idx:03d}/cookies.txt')
             try:
+                wait_global_rate_limit(global_rate_state=global_rate_state,
+                                       global_rate_lock=global_rate_lock,
+                                       sleep_interval_requests=sleep_interval_requests,
+                                       sleep_interval=sleep_interval,
+                                       max_sleep_interval=max_sleep_interval)
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     file_exist = os.path.isfile(os.path.join(outpath, f'{video_id}_{file_idx:03d}.{out_file_ext}'))
                     info=ydl.extract_info(url, download=not file_exist)
                     filename = f'{video_id}_{file_idx:03d}.{out_file_ext}'
                     jsonname = f'{video_id}_{file_idx:03d}.json'
                     if not file_exist:
-                        shutil.move(os.path.join(f'/temps/id_{video_id}_{file_idx:03d}',f'audio.{out_file_ext}'), os.path.join(outpath, filename))
+                        shutil.move(os.path.join(f'{temp_working_dir}/id_{video_id}_{file_idx:03d}',f'audio.{out_file_ext}'), os.path.join(outpath, filename))
                     else:
                         pass
                     file_meta = {'id':f'{video_id}','path': os.path.join(outpath, filename),'title': info['title'], 'url':url, 'start': start, 'end': to}
 
                     if autocap_caption is not None:
                         file_meta['autocap_caption'] = autocap_caption
-                        
-                    # meta data 
+
+                    # meta data
                     file_meta['resolution'] = info.get('resolution')
                     file_meta['fps'] = info.get('fps')
                     file_meta['aspect_ratio'] = info.get('aspect_ratio')
@@ -110,9 +153,9 @@ def download_yt_video(entry,
 
                     print("[INFO] save meta data for", os.path.join(outpath, jsonname))
                     json.dump(file_meta, open(os.path.join(outpath, jsonname),'w'))
-                os.system(f'rm -rf /temps/id_{video_id}_{file_idx:03d}')
+                os.system(f'rm -rf {temp_working_dir}/id_{video_id}_{file_idx:03d}')
             except Exception as e:
-                os.system(f'rm -rf /temps/id_{video_id}_{file_idx:03d}')
+                os.system(f'rm -rf {temp_working_dir}/id_{video_id}_{file_idx:03d}')
                 print(f"[ERROR] downloading {os.path.join(outpath, f'{video_id}_{file_idx:03d}.json')}:", e)
                 return f'{url} - ytdl : {log_stream.getvalue()}, system : {str(e)}'
     return None
@@ -122,12 +165,12 @@ def update_interval_dict(dict_1, dict_2):
     combine two dictionaries, and merge intervals list if it is replicated
     """
     for k, v in dict_2.items():
-        if k in dict_1: 
+        if k in dict_1:
             dict_2[k]['intervals'] += dict_1[k]['intervals']
-    
+
     dict_1.update(dict_2)
-        
-def read_video_segments_info(local_input_video_segments, 
+
+def read_video_segments_info(local_input_video_segments,
                              start_idx=0,
                              end_idx=int(1e9),
                              min_audio_len=0.0,
@@ -136,7 +179,7 @@ def read_video_segments_info(local_input_video_segments,
     total_number_of_clips = 0
     with open(local_input_video_segments, 'r') as f:
         last_idx = 0
-        for idx, json_str in enumerate(tqdm(f, desc="parsing json input")): 
+        for idx, json_str in enumerate(tqdm(f, desc="parsing json input")):
             if idx > start_idx:
                 try:
                     json_str = json_str.strip()
@@ -144,7 +187,7 @@ def read_video_segments_info(local_input_video_segments,
                         json_str = json_str[:-1]
                     if json_str.endswith(','):
                         json_str = json_str[:-1]
-                        
+
                     data = json.loads(json_str)
                     video_ids = list(data.keys())
                     if len(video_ids) == 0:
@@ -163,15 +206,16 @@ def read_video_segments_info(local_input_video_segments,
                     print("[ERROR] Couldn't parse json string:", json_str)
                     continue
                 last_idx += 1
-            
+
             if last_idx >= end_idx:
                 break
-    
+
     print(f"Found {total_number_of_clips} audio clips.")
     return all_video_segments
 
 def download_audioset_split(json_file,
                             save_dir,
+                            temp_working_dir,
                             yt_cookie_path,
                             audio_only=False,
                             proxy_port=None,
@@ -183,126 +227,171 @@ def download_audioset_split(json_file,
                             files_per_folder=5000,
                             clap_threshold=0.4,
                             min_audio_len=4,
+                            sleep_interval=10.0,
+                            sleep_interval_subtitles=5.0,
+                            sleep_interval_requests=0.75,
+                            max_sleep_interval=20.0,
                             ):
-    
+
     os.makedirs(save_dir, exist_ok=True)
-        
+    print(f"[INFO] Reading video segments information from {json_file}...")
+    print(f"[INFO] Temp working directory for downloads is set to {temp_working_dir}")
+
     all_video_segments = read_video_segments_info(json_file,
                                                   start_idx=start_idx,
                                                   end_idx=end_idx,
                                                   min_audio_len=min_audio_len,
                                                   clap_threshold=clap_threshold)
-    
-    download_audio_split = partial(download_yt_video,
-                                   save_dir=save_dir,
-                                   yt_cookie_path=yt_cookie_path,
-                                   audio_only=audio_only,
-                                   proxy=proxy_port,
-                                   audio_sampling_rate=audio_sampling_rate,
-                                   resume=resume,
-                                   files_per_folder=files_per_folder) 
-    
-    logs = []
-    p = get_context("spawn").Pool(num_processes*2)
-    
-    # download_audio_split = partial(save_metadata, split=split) # save_metadata
-    with tqdm(total=len(all_video_segments),leave=False) as pbar:
-        for log in p.imap_unordered(download_audio_split, enumerate(all_video_segments.items(), start=start_idx)):
-            logs.append(log)
-            pbar.update()
-    p.close()
-    p.join()
+
+    ctx = get_context("spawn")
+    with ctx.Manager() as manager:
+        global_rate_state = manager.dict()
+        global_rate_state["next_allowed_ts"] = 0.0
+        global_rate_lock = manager.Lock()
+
+        download_audio_split = partial(download_yt_video,
+                                       save_dir=save_dir,
+                                       temp_working_dir=temp_working_dir,
+                                       global_rate_state=global_rate_state,
+                                       global_rate_lock=global_rate_lock,
+                                       yt_cookie_path=yt_cookie_path,
+                                       audio_only=audio_only,
+                                       proxy=proxy_port,
+                                       audio_sampling_rate=audio_sampling_rate,
+                                       resume=resume,
+                                       files_per_folder=files_per_folder,
+                                       sleep_interval=sleep_interval,
+                                       sleep_interval_subtitles=sleep_interval_subtitles,
+                                       sleep_interval_requests=sleep_interval_requests,
+                                       max_sleep_interval=max_sleep_interval)
+
+        logs = []
+        p = ctx.Pool(num_processes*2)
+
+        # download_audio_split = partial(save_metadata, split=split) # save_metadata
+        with tqdm(total=len(all_video_segments),leave=False) as pbar:
+            for log in p.imap_unordered(download_audio_split, enumerate(all_video_segments.items(), start=start_idx)):
+                logs.append(log)
+                pbar.update()
+        p.close()
+        p.join()
     logs = [l for l in logs if l is not None]
     open(f'download_logs.txt','w').write('\n'.join(logs))
-    
+
 if __name__ == "__main__":
-    try:
-        shutil.rmtree('/temps')
-    except FileNotFoundError:
-        pass
-    os.makedirs('/temps', exist_ok=True)
-    
+    import tempfile
     parser = argparse.ArgumentParser()
-    
-    parser.add_argument("--dataset_name", 
+
+    parser.add_argument("--dataset_name",
                         type=str,
                         required=True,
                         help=f"Provided the dataset names. Available datasets are {dataset_urls.keys()}")
-    
-    parser.add_argument("--clap_threshold", 
+
+    parser.add_argument("--clap_threshold",
                         type=float,
                         required=False,
                         default=0.4,
                         help=f"Provided the clap similarity threshold to filter the dataset, default: 0.4")
-    
-    parser.add_argument("--min_audio_len", 
+
+    parser.add_argument("--min_audio_len",
                         type=float,
                         required=False,
                         default=4,
                         help=f"Provided the minimum audio clip length to filter the dataset, default: 4s")
-    
-    parser.add_argument("--input_file", 
+
+    parser.add_argument("--input_file",
                         type=str,
                         default=None,
                         required=False,
                         help="Provided the path to the json object that contains the dataset information. You may leave it empty to attempt to download the required files from the web")
-    
-    parser.add_argument("--save_dir", 
+
+    parser.add_argument("--save_dir",
                         type=str,
                         required=False,
                         default='data/datasets/autocap/videos',
                         help="where to save the downloaded files")
-    
-    parser.add_argument("--audio_only", 
+
+    parser.add_argument("--audio_only",
                         required=False,
                         action='store_true',
                         help="Enable to only save the wav files and discard the vidoes")
-    
-    parser.add_argument("--cookie_path", 
+
+    parser.add_argument("--cookie_path",
                         type=str,
                         required=False,
                         default=None,
                         help="Path to your Youtube cookies files")
-    
-    parser.add_argument("--sampling_rate", 
+
+    parser.add_argument("--sampling_rate",
                         type=int,
                         default=44100,
                         help="Audio sampling rate, default is set to 44.1KHz")
-    
-    parser.add_argument("--proxy", 
+
+    parser.add_argument("--proxy",
                         type=str,
                         default=None,
                         help="provde a proxy port to bypass youtube blocking your IP")
-    
-    parser.add_argument("--files_per_folder", 
+
+    parser.add_argument("--files_per_folder",
                         type=int,
                         default=50000,
                         help="How many files to store per folder")
-    
-    parser.add_argument('--start_idx', '-s', 
+
+    parser.add_argument('--start_idx', '-s',
                         type=int, default=0,
                         help="start index of the json objects in the provided files")
-    
+
     parser.add_argument('--end_idx', '-e', type=int, default=int(1e9),
                         help="start index of the json objects in the provided files")
-    
+
     parser.add_argument('--redownload', action='store_true',
                         help="redownload already downloaded files")
-    
-    args = parser.parse_args()
-    
-    if args.input_file is None or not os.path.exists(args.input_file):
-        args.input_file = get_dataset_json_file(args.dataset_name, args.input_file, download=True)
 
-    download_audioset_split(json_file=args.input_file,
-                            save_dir=args.save_dir,
-                            audio_only=args.audio_only,
-                            audio_sampling_rate=args.sampling_rate,
-                            yt_cookie_path=args.cookie_path,
-                            proxy_port=args.proxy,
-                            start_idx=args.start_idx,
-                            end_idx=args.end_idx,
-                            clap_threshold=args.clap_threshold,
-                            min_audio_len=args.min_audio_len,
-                            resume=not args.redownload,
-                            files_per_folder=args.files_per_folder)
+    parser.add_argument('--num_processes', type=int, default=os.cpu_count(),
+                        help="number of processes to use for downloading, default is set to the number of CPU cores")
+
+    parser.add_argument("--sleep_interval",
+                        type=float,
+                        default=10.0,
+                        help="Global and yt-dlp sleep interval lower bound")
+
+    parser.add_argument("--sleep_interval_subtitles",
+                        type=float,
+                        default=5.0,
+                        help="yt-dlp subtitle request sleep interval")
+
+    parser.add_argument("--sleep_interval_requests",
+                        type=float,
+                        default=0.75,
+                        help="Global and yt-dlp minimum gap between requests")
+
+    parser.add_argument("--max_sleep_interval",
+                        type=float,
+                        default=20.0,
+                        help="Global and yt-dlp sleep interval upper bound")
+
+    args = parser.parse_args()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        if args.input_file is None or not os.path.exists(args.input_file):
+            args.input_file = get_dataset_json_file(args.dataset_name, args.input_file, download=True)
+
+        download_audioset_split(json_file=args.input_file,
+                                save_dir=args.save_dir,
+                                temp_working_dir=temp_dir,
+                                audio_only=args.audio_only,
+                                audio_sampling_rate=args.sampling_rate,
+                                yt_cookie_path=args.cookie_path,
+                                proxy_port=args.proxy,
+                                start_idx=args.start_idx,
+                                end_idx=args.end_idx,
+                                clap_threshold=args.clap_threshold,
+                                min_audio_len=args.min_audio_len,
+                                sleep_interval=args.sleep_interval,
+                                sleep_interval_subtitles=args.sleep_interval_subtitles,
+                                sleep_interval_requests=args.sleep_interval_requests,
+                                max_sleep_interval=args.max_sleep_interval,
+                                resume=not args.redownload,
+                                files_per_folder=args.files_per_folder,
+                                num_processes=args.num_processes
+        )
