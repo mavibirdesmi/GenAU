@@ -1,46 +1,95 @@
 import os
 import shutil
 from tqdm import tqdm
-from multiprocessing import Pool, get_context
+from multiprocessing import get_context
 import yt_dlp
 import logging
 from io import StringIO
 import json
 import argparse
 from functools import partial
-import random
 import time
 from download_manager import get_dataset_json_file, dataset_urls
 
-def wait_global_rate_limit(global_rate_state,
-                           global_rate_lock,
-                           sleep_interval_requests,
-                           sleep_interval,
-                           max_sleep_interval):
-    if global_rate_state is None or global_rate_lock is None:
+RATE_LIMIT_COOLDOWN_SECONDS = 5 * 60
+RATE_LIMIT_ERROR_PATTERNS = (
+    "rate limit",
+    "too many requests",
+    "http error 429",
+    "status code 429",
+    "429:",
+    "429 ",
+    "requested format is not available due to rate limiting",
+)
+PERMANENT_VIDEO_ERROR_PATTERNS = (
+    "video unavailable",
+    "this video is unavailable",
+    "private video",
+    "video has been removed",
+    "video has been deleted",
+    "copyright strike",
+    "account associated with this video has been terminated",
+    "the uploader has not made this video available",
+    "sign in to confirm your age",
+    "this live event will begin in",
+    "this live event has ended",
+    "members-only content",
+)
+
+
+def is_rate_limit_error(error_text):
+    lowered = error_text.lower()
+    return any(pattern in lowered for pattern in RATE_LIMIT_ERROR_PATTERNS)
+
+
+def is_permanent_video_error(error_text):
+    lowered = error_text.lower()
+    if is_rate_limit_error(lowered):
+        return False
+    return any(pattern in lowered for pattern in PERMANENT_VIDEO_ERROR_PATTERNS)
+
+
+def write_json_file(path, payload):
+    with open(path, "w") as handle:
+        json.dump(payload, handle)
+
+
+def build_video_error_path(outpath, video_id):
+    return os.path.join(outpath, f"{video_id}.error.json")
+
+
+def register_rate_limit_cooldown(rate_state, rate_lock, cooldown_seconds=RATE_LIMIT_COOLDOWN_SECONDS):
+    if rate_state is None or rate_lock is None:
         return
 
-    request_gap = max(0.0, float(sleep_interval_requests))
-    interval_min = max(0.0, float(sleep_interval))
-    interval_max = max(interval_min, float(max_sleep_interval))
-    extra_gap = random.uniform(interval_min, interval_max) if interval_max > 0 else 0.0
-    total_gap = request_gap + extra_gap
+    with rate_lock:
+        cooldown_until_ts = time.monotonic() + cooldown_seconds
+        rate_state["cooldown_until_ts"] = max(rate_state.get("cooldown_until_ts", 0.0), cooldown_until_ts)
+        rate_state["next_allowed_ts"] = max(rate_state.get("next_allowed_ts", 0.0), rate_state["cooldown_until_ts"])
 
+
+def wait_for_global_download_slot(rate_state, rate_lock, max_videos_per_hour):
+    if rate_state is None or rate_lock is None or max_videos_per_hour <= 0:
+        return
+
+    min_interval_seconds = 3600.0 / float(max_videos_per_hour)
     while True:
-        with global_rate_lock:
+        with rate_lock:
             now = time.monotonic()
-            next_allowed_ts = global_rate_state.get("next_allowed_ts", 0.0)
-            wait_for = next_allowed_ts - now
-            if wait_for <= 0:
-                global_rate_state["next_allowed_ts"] = now + total_gap
+            next_allowed_ts = rate_state.get("next_allowed_ts", 0.0)
+            cooldown_until_ts = rate_state.get("cooldown_until_ts", 0.0)
+            wait_time = max(next_allowed_ts, cooldown_until_ts) - now
+            if wait_time <= 0:
+                rate_state["next_allowed_ts"] = now + min_interval_seconds
                 return
-        time.sleep(min(wait_for, 0.25))
+        time.sleep(min(wait_time, 0.25))
 
 def download_yt_video(entry,
                     save_dir,
                     temp_working_dir,
-                    global_rate_state=None,
-                    global_rate_lock=None,
+                    rate_state=None,
+                    rate_lock=None,
+                    max_videos_per_hour=1700.0,
                     yt_cookie_path=None,
                     audio_only=False,
                     proxy=None,
@@ -53,19 +102,23 @@ def download_yt_video(entry,
                     max_sleep_interval=20.0):
     video_idx = entry[0]
     video_id, intervals = entry[1][0], entry[1][1]['intervals']
+    subfolder_idx = f'{video_idx // files_per_folder:06}'
+    outpath = os.path.join(save_dir, subfolder_idx)
+    os.makedirs(outpath, exist_ok=True)
+    video_error_path = build_video_error_path(outpath, video_id)
+
+    if resume and os.path.isfile(video_error_path):
+        print(f"[INFO] skipping permanently failed video {video_id} because {video_error_path} exists")
+        return None
 
     for file_idx, video_info in enumerate(intervals):
         start = video_info['start']
         to = video_info['end']
         autocap_caption = video_info.get('text', None)
-        subfolder_idx = f'{video_idx // files_per_folder:06}'
-        st = f'{int(start//3600)}:{int(start//60)-60*int(start//3600)}:{start%60}'
-        dur = f'{int(to//3600)}:{int(to//60)-60*int(to//3600)}:{to%60}'
 
-        outpath = os.path.join(save_dir, subfolder_idx)
-        os.makedirs(outpath, exist_ok=True)
+        clip_json_path = os.path.join(outpath, f'{video_id}_{file_idx:03d}.json')
 
-        if resume and os.path.isfile(os.path.join(outpath, f'{video_id}_{file_idx:03d}.json')):
+        if resume and os.path.isfile(clip_json_path):
             continue
         else:
             ytdl_logger = logging.getLogger()
@@ -80,8 +133,6 @@ def download_yt_video(entry,
                 'format': format,
                 'quiet': True,
                 'ignoreerrors': False,
-                # 'write_thumbnail': True,
-                'writeinfojson': True,  # This will write a separate .info.json with detailed info
                 # 'writesubtitles': True,  # Attempt to download subtitles (transcripts)
                 # 'writeautomaticsub': True,  # Attempt to download automatic subtitles (auto-generated transcripts)
                 'force_generic_extractor': True,
@@ -92,11 +143,15 @@ def download_yt_video(entry,
                 'external_downloader_args':['-loglevel', 'quiet'],
                 "remote_components": ["ejs:github"],
                 "cookiesfrombrowser": ("firefox",),
-                "sleep_interval": sleep_interval,
-                "sleep_interval_subtitles": sleep_interval_subtitles,
-                "sleep_interval_requests": sleep_interval_requests,
-                "max_sleep_interval": max_sleep_interval,
             }
+            if sleep_interval > 0:
+                ydl_opts["sleep_interval"] = sleep_interval
+            if sleep_interval_subtitles > 0:
+                ydl_opts["sleep_interval_subtitles"] = sleep_interval_subtitles
+            if sleep_interval_requests > 0:
+                ydl_opts["sleep_interval_requests"] = sleep_interval_requests
+            if max_sleep_interval > 0:
+                ydl_opts["max_sleep_interval"] = max_sleep_interval
             if yt_cookie_path is not None:
                 ydl_opts['cookiefile'] = f'{temp_working_dir}/id_{video_id}_{file_idx:03d}/cookies.txt'
             if audio_only:
@@ -110,22 +165,21 @@ def download_yt_video(entry,
                 ydl_opts['proxy'] = f'socks5://127.0.0.1:{proxy}/'
 
             url = f'https://www.youtube.com/watch?v={video_id}'
-            os.makedirs(f'{temp_working_dir}/id_{video_id}_{file_idx:03d}', exist_ok=True)
+            temp_clip_dir = f'{temp_working_dir}/id_{video_id}_{file_idx:03d}'
+            os.makedirs(temp_clip_dir, exist_ok=True)
             if yt_cookie_path is not None:
-                shutil.copy(yt_cookie_path, f'{temp_working_dir}/id_{video_id}_{file_idx:03d}/cookies.txt')
+                shutil.copy(yt_cookie_path, f'{temp_clip_dir}/cookies.txt')
             try:
-                wait_global_rate_limit(global_rate_state=global_rate_state,
-                                       global_rate_lock=global_rate_lock,
-                                       sleep_interval_requests=sleep_interval_requests,
-                                       sleep_interval=sleep_interval,
-                                       max_sleep_interval=max_sleep_interval)
+                wait_for_global_download_slot(rate_state=rate_state,
+                                              rate_lock=rate_lock,
+                                              max_videos_per_hour=max_videos_per_hour)
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     file_exist = os.path.isfile(os.path.join(outpath, f'{video_id}_{file_idx:03d}.{out_file_ext}'))
                     info=ydl.extract_info(url, download=not file_exist)
                     filename = f'{video_id}_{file_idx:03d}.{out_file_ext}'
                     jsonname = f'{video_id}_{file_idx:03d}.json'
                     if not file_exist:
-                        shutil.move(os.path.join(f'{temp_working_dir}/id_{video_id}_{file_idx:03d}',f'audio.{out_file_ext}'), os.path.join(outpath, filename))
+                        shutil.move(os.path.join(temp_clip_dir, f'audio.{out_file_ext}'), os.path.join(outpath, filename))
                     else:
                         pass
                     file_meta = {'id':f'{video_id}','path': os.path.join(outpath, filename),'title': info['title'], 'url':url, 'start': start, 'end': to}
@@ -152,12 +206,35 @@ def download_yt_video(entry,
                     file_meta['channel_name'] = info.get('uploader')
 
                     print("[INFO] save meta data for", os.path.join(outpath, jsonname))
-                    json.dump(file_meta, open(os.path.join(outpath, jsonname),'w'))
-                os.system(f'rm -rf {temp_working_dir}/id_{video_id}_{file_idx:03d}')
+                    write_json_file(os.path.join(outpath, jsonname), file_meta)
+                shutil.rmtree(temp_clip_dir, ignore_errors=True)
             except Exception as e:
-                os.system(f'rm -rf {temp_working_dir}/id_{video_id}_{file_idx:03d}')
-                print(f"[ERROR] downloading {os.path.join(outpath, f'{video_id}_{file_idx:03d}.json')}:", e)
-                return f'{url} - ytdl : {log_stream.getvalue()}, system : {str(e)}'
+                shutil.rmtree(temp_clip_dir, ignore_errors=True)
+                error_text = f'{url} - ytdl : {log_stream.getvalue()}, system : {str(e)}'
+                if is_rate_limit_error(error_text):
+                    register_rate_limit_cooldown(rate_state=rate_state,
+                                                 rate_lock=rate_lock,
+                                                 cooldown_seconds=RATE_LIMIT_COOLDOWN_SECONDS)
+                    print(f"[ERROR] rate limited while downloading {clip_json_path}: {e}")
+                    return error_text
+
+                if is_permanent_video_error(error_text):
+                    error_meta = {
+                        "id": video_id,
+                        "url": url,
+                        "status": "error",
+                        "retryable": False,
+                        "failed_interval_index": file_idx,
+                        "start": start,
+                        "end": to,
+                        "error": str(e),
+                        "log": log_stream.getvalue(),
+                    }
+                    write_json_file(video_error_path, error_meta)
+                    print(f"[ERROR] marked video {video_id} as permanently failed at {video_error_path}: {e}")
+                else:
+                    print(f"[ERROR] downloading {clip_json_path}:", e)
+                return error_text
     return None
 
 def update_interval_dict(dict_1, dict_2):
@@ -227,6 +304,7 @@ def download_audioset_split(json_file,
                             files_per_folder=5000,
                             clap_threshold=0.4,
                             min_audio_len=4,
+                            max_videos_per_hour=1700.0,
                             sleep_interval=10.0,
                             sleep_interval_subtitles=5.0,
                             sleep_interval_requests=0.75,
@@ -245,15 +323,17 @@ def download_audioset_split(json_file,
 
     ctx = get_context("spawn")
     with ctx.Manager() as manager:
-        global_rate_state = manager.dict()
-        global_rate_state["next_allowed_ts"] = 0.0
-        global_rate_lock = manager.Lock()
+        rate_state = manager.dict()
+        rate_state["next_allowed_ts"] = 0.0
+        rate_state["cooldown_until_ts"] = 0.0
+        rate_lock = manager.Lock()
 
         download_audio_split = partial(download_yt_video,
                                        save_dir=save_dir,
                                        temp_working_dir=temp_working_dir,
-                                       global_rate_state=global_rate_state,
-                                       global_rate_lock=global_rate_lock,
+                                       rate_state=rate_state,
+                                       rate_lock=rate_lock,
+                                       max_videos_per_hour=max_videos_per_hour,
                                        yt_cookie_path=yt_cookie_path,
                                        audio_only=audio_only,
                                        proxy=proxy_port,
@@ -350,24 +430,29 @@ if __name__ == "__main__":
     parser.add_argument('--num_processes', type=int, default=os.cpu_count(),
                         help="number of processes to use for downloading, default is set to the number of CPU cores")
 
+    parser.add_argument("--max_videos_per_hour",
+                        type=float,
+                        default=1700.0,
+                        help="Global cap on started video downloads across all workers")
+
     parser.add_argument("--sleep_interval",
                         type=float,
-                        default=10.0,
+                        default=0.0,
                         help="Global and yt-dlp sleep interval lower bound")
 
     parser.add_argument("--sleep_interval_subtitles",
                         type=float,
-                        default=5.0,
+                        default=0.0,
                         help="yt-dlp subtitle request sleep interval")
 
     parser.add_argument("--sleep_interval_requests",
                         type=float,
-                        default=0.75,
+                        default=0.0,
                         help="Global and yt-dlp minimum gap between requests")
 
     parser.add_argument("--max_sleep_interval",
                         type=float,
-                        default=20.0,
+                        default=0.0,
                         help="Global and yt-dlp sleep interval upper bound")
 
     args = parser.parse_args()
@@ -387,6 +472,7 @@ if __name__ == "__main__":
                                 end_idx=args.end_idx,
                                 clap_threshold=args.clap_threshold,
                                 min_audio_len=args.min_audio_len,
+                                max_videos_per_hour=args.max_videos_per_hour,
                                 sleep_interval=args.sleep_interval,
                                 sleep_interval_subtitles=args.sleep_interval_subtitles,
                                 sleep_interval_requests=args.sleep_interval_requests,
