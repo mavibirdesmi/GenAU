@@ -163,8 +163,8 @@ def upload_subset_to_tigris(s3, bucket, subset_dir, subset_name, uploaded_object
     recorded as uploaded locally (so resumed runs don't re-upload or fetch from Tigris).
 
     Data files are committed to the local uploaded-objects log as they upload. The manifest is
-    uploaded last but is NOT committed here; the caller commits it to the log only after remote
-    verification passes, so a failed verification never marks the subset complete.
+    always (re-)uploaded to Tigris (overwriting whatever is there) so the bucket always holds
+    the latest checksums; it is committed to the log only by the caller after verification.
     """
     local = {}
     for fname in sorted(os.listdir(subset_dir)):
@@ -184,8 +184,10 @@ def upload_subset_to_tigris(s3, bucket, subset_dir, subset_name, uploaded_object
         for fname in bar:
             fpath = os.path.join(subset_dir, fname)
             key = f"{subset_name}/{fname}"
-            if key in uploaded_objects and uploaded_objects[key] == local[fname]:
-                skipped += 1  # already uploaded (matching size) per the local log
+            # the manifest is always (re-)uploaded (overwrite) whether it exists or not;
+            # data files are skipped if already recorded with a matching size.
+            if fname != manifest_name and key in uploaded_objects and uploaded_objects[key] == local[fname]:
+                skipped += 1
                 continue
             _upload_file_with_retry(s3, bucket, fpath, key)
             if fname != manifest_name:  # manifest is committed by the caller after verification
