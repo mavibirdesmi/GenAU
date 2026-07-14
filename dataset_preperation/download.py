@@ -747,7 +747,7 @@ def download_audioset_split(json_file,
         pool = ctx.Pool(num_processes * 2, initializer=_init_pool_worker,
                         initargs=(download_audio_split,))
         try:
-            with tqdm(total=len(all_entries), desc="download", position=0) as pbar:
+            with tqdm(total=len(all_entries), desc="download") as pbar:
                 for subset_idx in sorted_subset_idxs:
                     subset_name = f"{subset_idx:06d}"
                     subset_dir = os.path.join(save_dir, subset_name)
