@@ -87,6 +87,45 @@ CLIP_FILE_RE = re.compile(r"^(.+)_(\d{3})\.(?:mp4|wav|json)$")
 ERROR_FILE_RE = re.compile(r"^(.+)\.error\.json$")
 
 
+def is_ignorable_junk(fname):
+    """True for OS-generated junk that is NOT a real dataset file and must be ignored everywhere
+    (never treated as a clip, uploaded, hashed, or flagged as a stray).
+
+    Covers macOS AppleDouble `._*` resource-fork files (one per real file on ExFAT/NTFS drives),
+    `.DS_Store`, any dot-prefixed hidden file, and Windows `Thumbs.db` / `desktop.ini`.
+    Real clip filenames are `<youtube_id>_<NNN>.<ext>` and never start with '.'.
+    """
+    if fname.startswith("."):
+        return True
+    return fname in ("Thumbs.db", "desktop.ini")
+
+
+def clean_junk_files(dir_path):
+    """Delete OS-generated junk files (._*, .DS_Store, Thumbs.db, desktop.ini) from a directory.
+
+    Real dataset files never start with '.', so this is safe. Returns the number of files removed.
+    """
+    removed = 0
+    try:
+        names = os.listdir(dir_path)
+    except OSError:
+        return 0
+    for fname in names:
+        if not is_ignorable_junk(fname):
+            continue
+        path = os.path.join(dir_path, fname)
+        try:
+            if os.path.isfile(path) or os.path.islink(path):
+                os.remove(path)
+                removed += 1
+            elif os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+                removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 def _env(*names, default=None):
     """Return the first non-empty environment variable among `names`, else `default`."""
     for name in names:
@@ -133,7 +172,7 @@ def compute_subset_sha256(subset_dir, manifest_name=SHA256_MANIFEST_NAME):
     to_hash = []
     for fname in sorted(os.listdir(subset_dir)):
         fpath = os.path.join(subset_dir, fname)
-        if not os.path.isfile(fpath) or fname == manifest_name:
+        if not os.path.isfile(fpath) or fname == manifest_name or is_ignorable_junk(fname):
             continue
         to_hash.append((fname, fpath, os.path.getsize(fpath)))
 
@@ -187,7 +226,7 @@ def upload_subset_to_tigris(s3, data_bucket, manifest_bucket, subset_dir, subset
     local = {}
     for fname in sorted(os.listdir(subset_dir)):
         fpath = os.path.join(subset_dir, fname)
-        if os.path.isfile(fpath):
+        if os.path.isfile(fpath) and not is_ignorable_junk(fname):
             local[fname] = os.path.getsize(fpath)
     if not local:
         return
@@ -376,7 +415,10 @@ def remove_lowest_index_subset(save_dir, current_subset_name, manifest_name=SHA2
 # actually belongs to that subset (its video_id is one of the subset's videos).
 
 def parse_clip_video_id(fname):
-    """Return the video_id embedded in a clip/error filename, or None for non-clip files."""
+    """Return the video_id embedded in a clip/error filename, or None for non-clip files
+    (including OS junk like macOS `._*` AppleDouble files)."""
+    if is_ignorable_junk(fname):
+        return None
     m = CLIP_FILE_RE.match(fname)
     if m:
         return m.group(1)
@@ -412,26 +454,34 @@ def find_stray_files(subset_dir, subset_entries):
 
 
 def reorganize_local_subsets(save_dir, vid_to_subset):
-    """One-time pass: move every misplaced clip/error file into its correct subset folder.
+    """One-time cleanup pass over the 6-digit subset folders:
+      - delete OS junk (._*, .DS_Store, Thumbs.db, desktop.ini)
+      - move misplaced clip/error files into their correct subset folder
+      - exact-duplicate conflicts (same size) -> drop the misplaced copy
+      - size-different conflicts and out-of-range strays -> delete (no quarantine)
 
-    Use BEFORE uploading any subsets to Tigris (e.g. on the first Tigris run after an older run
-    with a different --files_per_folder). Moving a file into a subset that is already uploaded to
-    Tigris would desync the local copy from the remote manifest, so don't run this after uploads.
-    Returns (moved, skipped) where skipped covers out-of-range videos and name conflicts.
+    After this pass the 6-digit subset folders contain only files that belong to them, so the
+    per-subset stray check passes. Use BEFORE uploading subsets to Tigris; moving a file into a
+    subset that is already uploaded would desync the local copy from the remote manifest.
+    Returns (moved, deleted, junk_deleted).
     """
     moved = 0
-    skipped = 0
+    deleted = 0
+    junk_deleted = 0
     for name in os.listdir(save_dir):
         sub = os.path.join(save_dir, name)
         if not os.path.isdir(sub) or not SUBSET_NAME_RE.match(name):
             continue
+        junk_deleted += clean_junk_files(sub)
         for fname in os.listdir(sub):
             vid = parse_clip_video_id(fname)
             if vid is None:
-                continue  # manifest / junk -> leave it
+                continue  # manifest / non-clip -> leave it
+            src = os.path.join(sub, fname)
             correct = vid_to_subset.get(vid)
             if correct is None:
-                skipped += 1  # video not in this run's dataset range -> can't place it
+                os.remove(src)  # out-of-range stray -> remove
+                deleted += 1
                 continue
             if correct == name:
                 continue  # already in the right folder
@@ -439,11 +489,17 @@ def reorganize_local_subsets(save_dir, vid_to_subset):
             os.makedirs(dst_dir, exist_ok=True)
             dst = os.path.join(dst_dir, fname)
             if os.path.exists(dst):
-                skipped += 1  # conflict; don't overwrite
+                if os.path.getsize(dst) == os.path.getsize(src):
+                    os.remove(src)  # exact duplicate -> drop the misplaced copy
+                    deleted += 1
+                else:
+                    os.remove(src)  # size-different conflict -> remove the misplaced one
+                    deleted += 1
                 continue
-            shutil.move(os.path.join(sub, fname), dst)
+            shutil.move(src, dst)
             moved += 1
-    return moved, skipped
+    return moved, deleted, junk_deleted
+
 
 
 
@@ -838,11 +894,11 @@ def download_audioset_split(json_file,
     # Map every video_id to the subset folder it belongs in, used to detect/relocate stray files.
     vid_to_subset = build_video_to_subset_map(all_entries, files_per_folder)
     if reorganize_local:
-        print("[INFO] Reorganizing local subset folders (moving misplaced clips to their "
-              f"correct subsets). Use this BEFORE uploading subsets to Tigris.")
-        moved, skipped = reorganize_local_subsets(save_dir, vid_to_subset)
-        print(f"[INFO] Reorganize done: {moved} file(s) moved, {skipped} skipped "
-              f"(out-of-range videos / name conflicts).")
+        print("[INFO] Reorganizing local subset folders: deleting OS junk and moving misplaced "
+              f"clips to their correct subsets. Use this BEFORE uploading subsets to Tigris.")
+        moved, deleted, junk_deleted = reorganize_local_subsets(save_dir, vid_to_subset)
+        print(f"[INFO] Reorganize done: {moved} moved, {deleted} stray/conflict file(s) removed, "
+              f"{junk_deleted} OS junk file(s) deleted (._*, .DS_Store, ...).")
 
     s3 = get_tigris_client(tigris_endpoint) if upload_to_tigris else None
     if upload_to_tigris:
