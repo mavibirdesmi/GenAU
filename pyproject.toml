@@ -5,7 +5,10 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "boto3>=1.43.47",
     "huggingface-hub>=1.8.0",
+    "python-dotenv>=1.2.2",
+    "tigris-boto3-ext>=0.3.0",
     "tqdm>=4.67.3",
     "wget>=3.2",
     "yt-dlp>=2026.3.17",

@@ -2,3 +2,7 @@ data
 core*
 .vscode
 download_logs.txt
+# Real dotenv files may contain secrets; keep the .env.example tracked instead.
+.env
+.env.*
+!.env.example

@@ -9,6 +9,12 @@ import json
 import argparse
 from functools import partial
 import time
+import hashlib
+import errno
+import re
+import subprocess
+import boto3
+from dotenv import load_dotenv
 from download_manager import get_dataset_json_file, dataset_urls
 
 RATE_LIMIT_COOLDOWN_SECONDS = 5 * 60
@@ -47,6 +53,177 @@ def is_permanent_video_error(error_text):
     if is_rate_limit_error(lowered):
         return False
     return any(pattern in lowered for pattern in PERMANENT_VIDEO_ERROR_PATTERNS)
+
+
+# --------------------------------------------------------------------------------------------------
+# Tigris (S3-compatible) integration
+# --------------------------------------------------------------------------------------------------
+#
+# After every subset (folder) finishes downloading, the pipeline:
+#   1. re-probes transient (e.g. rate-limit) download errors until they clear (or max rounds),
+#   2. computes a sha256sum manifest for the subset,
+#   3. uploads the manifest + every file in the subset folder to the Tigris bucket,
+#   4. verifies that the remote objects match the local folder (names + sizes),
+#   5. only then moves on to the next subset.
+#
+# If the disk runs out of storage at any point, the lowest-index subset already backed up to
+# Tigris is removed locally to free space, disk usage is reported (df -H), and the current
+# subset is restarted from the beginning (already-downloaded clips are skipped thanks to resume).
+
+NOSPACE_MARKER = "__NOSPACE__"
+TIGRIS_DEFAULT_ENDPOINT = "https://t3.storage.dev"
+TIGRIS_DEFAULT_BUCKET = "genau-dataset"
+SUBSET_NAME_RE = re.compile(r"^\d{6}$")
+SHA256_MANIFEST_NAME = "sha256sum.txt"
+
+
+def _env(*names, default=None):
+    """Return the first non-empty environment variable among `names`, else `default`."""
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return default
+
+
+def is_out_of_storage_error(exc=None, error_text=""):
+    """Detect an out-of-storage / ENOSPC condition from an exception or an error string."""
+    if exc is not None and isinstance(exc, OSError) and exc.errno in (errno.ENOSPC,):
+        return True
+    lowered = (error_text or "").lower()
+    return "no space left on device" in lowered or "enospc" in lowered
+
+
+def get_tigris_client(endpoint_url=None, region_name=None):
+    """Create an S3-compatible client pointed at Tigris.
+
+    Endpoint, region and credentials are resolved from environment variables (loaded from a
+    `.env` file via `load_dotenv()` or exported in the shell), following the Tigris quickstart.
+    AWS_* names are standard; TIGRIS_* names are aliases that fill in when AWS_* is absent.
+    """
+    endpoint = endpoint_url or _env("AWS_ENDPOINT_URL", "TIGRIS_ENDPOINT_URL") or TIGRIS_DEFAULT_ENDPOINT
+    region = region_name or _env("AWS_REGION", "TIGRIS_REGION", "AWS_DEFAULT_REGION") or "auto"
+    access_key = _env("AWS_ACCESS_KEY_ID", "TIGRIS_ACCESS_KEY_ID")
+    secret_key = _env("AWS_SECRET_ACCESS_KEY", "TIGRIS_SECRET_ACCESS_KEY")
+    kwargs = {"endpoint_url": endpoint, "region_name": region}
+    if access_key and secret_key:
+        kwargs["aws_access_key_id"] = access_key
+        kwargs["aws_secret_access_key"] = secret_key
+    return boto3.client("s3", **kwargs)
+
+
+def compute_subset_sha256(subset_dir, manifest_name=SHA256_MANIFEST_NAME):
+    """Compute a sha256sum-style manifest for every file in the subset folder.
+
+    The manifest is written to <subset_dir>/<manifest_name> in the same format as the
+    `sha256sum` coreutil: "<hexdigest>  <filename>". The manifest file itself is excluded.
+    """
+    entries = []
+    for fname in sorted(os.listdir(subset_dir)):
+        fpath = os.path.join(subset_dir, fname)
+        if not os.path.isfile(fpath) or fname == manifest_name:
+            continue
+        digest = hashlib.sha256()
+        with open(fpath, "rb") as handle:
+            while True:
+                chunk = handle.read(1 << 20)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        entries.append(f"{digest.hexdigest()}  {fname}")
+    manifest_path = os.path.join(subset_dir, manifest_name)
+    with open(manifest_path, "w") as handle:
+        handle.write("\n".join(entries) + ("\n" if entries else ""))
+    return manifest_path
+
+
+def _upload_file_with_retry(s3, bucket, local_path, key, max_retries=3):
+    last_exc = RuntimeError("upload failed: no attempts made")
+    for attempt in range(max_retries):
+        try:
+            s3.upload_file(local_path, bucket, key)
+            return
+        except Exception as exc:  # noqa: BLE001 - retry any transient S3 error
+            last_exc = exc
+            print(f"[WARN] upload attempt {attempt + 1}/{max_retries} failed for '{key}': {exc}")
+            time.sleep(2 * (attempt + 1))
+    raise last_exc
+
+
+def upload_subset_to_tigris(s3, bucket, subset_dir, subset_name, manifest_name=SHA256_MANIFEST_NAME):
+    """Upload every file in the local subset folder to <bucket>/<subset_name>/<filename>."""
+    for fname in tqdm(sorted(os.listdir(subset_dir)), desc=f"[Tigris] upload {subset_name}", leave=False):
+        fpath = os.path.join(subset_dir, fname)
+        if not os.path.isfile(fpath):
+            continue
+        _upload_file_with_retry(s3, bucket, fpath, f"{subset_name}/{fname}")
+
+
+def _list_remote_subset(s3, bucket, subset_name):
+    remote = {}
+    prefix = f"{subset_name}/"
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            fname = obj["Key"][len(prefix):]
+            if fname:
+                remote[fname] = int(obj.get("Size", -1))
+    return remote
+
+
+def verify_subset_in_tigris(s3, bucket, subset_dir, subset_name):
+    """Return (missing, size_mismatch, extra) lists comparing the local subset folder to Tigris."""
+    local = {}
+    for fname in sorted(os.listdir(subset_dir)):
+        fpath = os.path.join(subset_dir, fname)
+        if os.path.isfile(fpath):
+            local[fname] = os.path.getsize(fpath)
+    remote = _list_remote_subset(s3, bucket, subset_name)
+    missing = sorted(f for f in local if f not in remote)
+    size_mismatch = sorted(f for f in local if f in remote and remote[f] != local[f])
+    extra = sorted(f for f in remote if f not in local)
+    return missing, size_mismatch, extra
+
+
+def remove_lowest_index_subset(save_dir, current_subset_name):
+    """Remove and return the name of the lowest-index subset folder (excluding the current one).
+
+    Returns None when there is no other subset to remove (e.g. the current subset is 000000).
+    """
+    candidates = []
+    for name in os.listdir(save_dir):
+        full = os.path.join(save_dir, name)
+        if os.path.isdir(full) and SUBSET_NAME_RE.match(name) and name != current_subset_name:
+            candidates.append(name)
+    if not candidates:
+        return None
+    lowest = min(candidates)
+    shutil.rmtree(os.path.join(save_dir, lowest), ignore_errors=True)
+    return lowest
+
+
+def show_disk_usage():
+    print("[INFO] Current disk usage (df -H):")
+    try:
+        subprocess.run(["df", "-H"], check=False)
+    except FileNotFoundError:
+        usage = shutil.disk_usage(os.getcwd())
+        print(f"[INFO] (df not available) total={usage.total} used={usage.used} free={usage.free}")
+
+
+def clean_temp_dir(temp_working_dir):
+    """Remove leftover worker scratch directories after a pool termination."""
+    if not temp_working_dir or not os.path.isdir(temp_working_dir):
+        return
+    for name in os.listdir(temp_working_dir):
+        path = os.path.join(temp_working_dir, name)
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                os.remove(path)
+        except OSError:
+            pass
 
 
 def write_json_file(path, payload):
@@ -104,7 +281,13 @@ def download_yt_video(entry,
     video_id, intervals = entry[1][0], entry[1][1]['intervals']
     subfolder_idx = f'{video_idx // files_per_folder:06}'
     outpath = os.path.join(save_dir, subfolder_idx)
-    os.makedirs(outpath, exist_ok=True)
+    try:
+        os.makedirs(outpath, exist_ok=True)
+    except OSError as _e:
+        if is_out_of_storage_error(_e):
+            print(f"[FATAL] out of storage while creating subset folder {outpath}: {_e}")
+            return f"{NOSPACE_MARKER}: creating {outpath}: {_e}"
+        raise
     video_error_path = build_video_error_path(outpath, video_id)
 
     if resume and os.path.isfile(video_error_path):
@@ -211,6 +394,9 @@ def download_yt_video(entry,
             except Exception as e:
                 shutil.rmtree(temp_clip_dir, ignore_errors=True)
                 error_text = f'{url} - ytdl : {log_stream.getvalue()}, system : {str(e)}'
+                if is_out_of_storage_error(e, error_text):
+                    print(f"[FATAL] out of storage while downloading {clip_json_path}: {e}")
+                    return f"{NOSPACE_MARKER}: {error_text}"
                 if is_rate_limit_error(error_text):
                     register_rate_limit_cooldown(rate_state=rate_state,
                                                  rate_lock=rate_lock,
@@ -290,6 +476,50 @@ def read_video_segments_info(local_input_video_segments,
     print(f"Found {total_number_of_clips} audio clips.")
     return all_video_segments
 
+# Module-level worker glue so the spawn-based pool can map over entries while returning
+# which entry each result belongs to (needed to retry only the failed entries).
+_WORKER_DOWNLOAD_FN = None
+
+
+def _init_pool_worker(download_fn):
+    global _WORKER_DOWNLOAD_FN
+    _WORKER_DOWNLOAD_FN = download_fn
+
+
+def _download_entry(entry):
+    """Run download_yt_video for one entry and tag the result with its video index."""
+    if _WORKER_DOWNLOAD_FN is None:  # not initialized (should not happen with the pool initializer)
+        raise RuntimeError("pool worker download function was not initialized")
+    result = _WORKER_DOWNLOAD_FN(entry)
+    return (entry[0], result)
+
+
+def _write_logs(logs, path):
+    try:
+        with open(path, "w") as handle:
+            handle.write("\n".join(str(log) for log in logs if log is not None))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[WARN] could not write logs to {path}: {exc}")
+
+
+def _download_subset_via_pool(pool, subset_entries, pbar):
+    """Download a subset's entries through the pool.
+
+    Returns (results, nospace) where results is a list of (video_idx, result) and nospace is
+    True if any worker reported an out-of-storage condition. On NOSPACE we stop consuming
+    early; the caller is responsible for terminating/recreating the pool.
+    """
+    results = []
+    nospace = False
+    for video_idx, result in pool.imap_unordered(_download_entry, subset_entries):
+        pbar.update()
+        results.append((video_idx, result))
+        if isinstance(result, str) and result.startswith(NOSPACE_MARKER):
+            nospace = True
+            break
+    return results, nospace
+
+
 def download_audioset_split(json_file,
                             save_dir,
                             temp_working_dir,
@@ -309,17 +539,52 @@ def download_audioset_split(json_file,
                             sleep_interval_subtitles=5.0,
                             sleep_interval_requests=0.75,
                             max_sleep_interval=20.0,
+                            upload_to_tigris=True,
+                            tigris_bucket=TIGRIS_DEFAULT_BUCKET,
+                            tigris_endpoint=None,
+                            max_retry_rounds=3,
+                            subset_log_path="download_logs.txt",
                             ):
 
     os.makedirs(save_dir, exist_ok=True)
     print(f"[INFO] Reading video segments information from {json_file}...")
     print(f"[INFO] Temp working directory for downloads is set to {temp_working_dir}")
 
+    # Resolve Tigris settings from the environment (.env file / exported env vars) when not
+    # provided explicitly. Real env vars win over the .env file (see load_env_files).
+    if tigris_bucket is None:
+        tigris_bucket = _env("TIGRIS_BUCKET", default=TIGRIS_DEFAULT_BUCKET)
+    if tigris_endpoint is None:
+        tigris_endpoint = _env("AWS_ENDPOINT_URL", "TIGRIS_ENDPOINT_URL")
+
+    num_processes = num_processes or os.cpu_count() or 1
+
     all_video_segments = read_video_segments_info(json_file,
                                                   start_idx=start_idx,
                                                   end_idx=end_idx,
                                                   min_audio_len=min_audio_len,
                                                   clap_threshold=clap_threshold)
+
+    # Group the (video_idx, (video_id, info)) entries into subsets keyed by folder index.
+    all_entries = list(enumerate(all_video_segments.items(), start=start_idx))
+    subsets = {}
+    for entry in all_entries:
+        subset_idx = entry[0] // files_per_folder
+        subsets.setdefault(subset_idx, []).append(entry)
+    sorted_subset_idxs = sorted(subsets.keys())
+    if not sorted_subset_idxs:
+        print("[INFO] No video segments to download.")
+        return
+    print(f"[INFO] {len(all_entries)} videos grouped into {len(sorted_subset_idxs)} subsets "
+          f"(files_per_folder={files_per_folder}): "
+          f"{sorted_subset_idxs[0]:06d}..{sorted_subset_idxs[-1]:06d}")
+
+    s3 = get_tigris_client(tigris_endpoint) if upload_to_tigris else None
+    if upload_to_tigris:
+        print(f"[INFO] Tigris uploads enabled: bucket='{tigris_bucket}' "
+              f"endpoint={tigris_endpoint or TIGRIS_DEFAULT_ENDPOINT}")
+    else:
+        print("[INFO] Tigris uploads disabled; subsets will only be kept locally.")
 
     ctx = get_context("spawn")
     with ctx.Manager() as manager:
@@ -345,18 +610,130 @@ def download_audioset_split(json_file,
                                        sleep_interval_requests=sleep_interval_requests,
                                        max_sleep_interval=max_sleep_interval)
 
-        logs = []
-        p = ctx.Pool(num_processes*2)
+        all_logs = []
+        pool = ctx.Pool(num_processes * 2, initializer=_init_pool_worker,
+                        initargs=(download_audio_split,))
+        try:
+            with tqdm(total=len(all_entries), desc="download", position=0) as pbar:
+                for subset_idx in sorted_subset_idxs:
+                    subset_name = f"{subset_idx:06d}"
+                    subset_dir = os.path.join(save_dir, subset_name)
+                    subset_entries = subsets[subset_idx]
+                    entry_by_idx = {e[0]: e for e in subset_entries}
+                    pbar.set_postfix_str(f"subset={subset_name} n={len(subset_entries)}")
+                    print(f"\n[INFO] === Subset {subset_name}: {len(subset_entries)} videos ===")
 
-        # download_audio_split = partial(save_metadata, split=split) # save_metadata
-        with tqdm(total=len(all_video_segments),leave=False) as pbar:
-            for log in p.imap_unordered(download_audio_split, enumerate(all_video_segments.items(), start=start_idx)):
-                logs.append(log)
-                pbar.update()
-        p.close()
-        p.join()
-    logs = [l for l in logs if l is not None]
-    open(f'download_logs.txt','w').write('\n'.join(logs))
+                    # ------------------------------------------------------------------
+                    # 1-2. Download subset, probing transient (rate-limit) errors again.
+                    #     On out-of-storage: prune the lowest-index subset and restart.
+                    # ------------------------------------------------------------------
+                    while True:
+                        round_entries = subset_entries
+                        transient_remaining = False
+                        for attempt in range(max(1, max_retry_rounds)):
+                            results, nospace = _download_subset_via_pool(pool, round_entries, pbar)
+                            if nospace:
+                                break
+
+                            # record non-NOSPACE errors for the log file
+                            for _vi, result in results:
+                                if result is not None and not result.startswith(NOSPACE_MARKER):
+                                    all_logs.append(result)
+
+                            failed_idxs = [vi for vi, result in results
+                                          if result is not None and not is_permanent_video_error(result)]
+                            if not failed_idxs:
+                                transient_remaining = False
+                                break
+                            transient_remaining = True
+                            print(f"[INFO] subset {subset_name}: {len(failed_idxs)} transient error(s) "
+                                  f"after probe round {attempt + 1}; probing again...")
+                            round_entries = [entry_by_idx[vi] for vi in failed_idxs]
+                            # give rate limits some time to clear before re-probing
+                            time.sleep(min(RATE_LIMIT_COOLDOWN_SECONDS, 30))
+
+                        if nospace:
+                            print(f"[FATAL] out of storage while downloading subset {subset_name}.")
+                            removed = remove_lowest_index_subset(save_dir, subset_name)
+                            show_disk_usage()
+                            if removed is None:
+                                print(f"[FATAL] No lower-index subset available to remove for "
+                                      f"{subset_name}. Stopping to avoid data loss.")
+                                _write_logs(all_logs, subset_log_path)
+                                return
+                            print(f"[INFO] Removed lowest-index subset {removed} to free space. "
+                                  f"Restarting subset {subset_name} from the start.")
+                            clean_temp_dir(temp_working_dir)
+                            pool.terminate()
+                            pool.join()
+                            pool = ctx.Pool(num_processes * 2, initializer=_init_pool_worker,
+                                            initargs=(download_audio_split,))
+                            continue  # restart this subset from the beginning (resume skips done clips)
+
+                        if transient_remaining:
+                            print(f"[ERROR] subset {subset_name} still has transient errors after "
+                                  f"{max_retry_rounds} probe round(s). Stopping.")
+                            _write_logs(all_logs, subset_log_path)
+                            return
+                        break  # subset download complete, proceed to sha256 + upload
+
+                    # ------------------------------------------------------------------
+                    # 3. Compute the sha256sum manifest for this subset.
+                    # ------------------------------------------------------------------
+                    print(f"[INFO] Computing sha256sum for subset {subset_name}...")
+                    try:
+                        compute_subset_sha256(subset_dir)
+                    except OSError as exc:
+                        if not is_out_of_storage_error(exc):
+                            raise
+                        print(f"[FATAL] out of storage while writing sha256sum for {subset_name}.")
+                        removed = remove_lowest_index_subset(save_dir, subset_name)
+                        show_disk_usage()
+                        if removed is None:
+                            print(f"[FATAL] No lower-index subset to remove. Stopping.")
+                            _write_logs(all_logs, subset_log_path)
+                            return
+                        print(f"[INFO] Removed lowest-index subset {removed} to free space.")
+                        clean_temp_dir(temp_working_dir)
+                        compute_subset_sha256(subset_dir)
+
+                    # ------------------------------------------------------------------
+                    # 4-5. Upload the subset (+ manifest) to Tigris and verify it matches.
+                    # ------------------------------------------------------------------
+                    if upload_to_tigris:
+                        print(f"[INFO] Uploading subset {subset_name} to Tigris bucket '{tigris_bucket}'...")
+                        upload_subset_to_tigris(s3, tigris_bucket, subset_dir, subset_name)
+
+                        missing, size_mismatch, extra = verify_subset_in_tigris(
+                            s3, tigris_bucket, subset_dir, subset_name)
+                        if missing or size_mismatch:
+                            print(f"[WARN] subset {subset_name} verify mismatch -> re-uploading: "
+                                  f"missing={missing}, size_mismatch={size_mismatch}, extra={extra}")
+                            for fname in missing + size_mismatch:
+                                fpath = os.path.join(subset_dir, fname)
+                                if os.path.isfile(fpath):
+                                    _upload_file_with_retry(s3, tigris_bucket, fpath,
+                                                            f"{subset_name}/{fname}")
+                            missing, size_mismatch, extra = verify_subset_in_tigris(
+                                s3, tigris_bucket, subset_dir, subset_name)
+
+                        if missing or size_mismatch or extra:
+                            print(f"[ERROR] subset {subset_name} failed verification in Tigris. Stopping. "
+                                  f"missing={missing}, size_mismatch={size_mismatch}, extra={extra}")
+                            _write_logs(all_logs, subset_log_path)
+                            return
+                        n_files = sum(1 for f in os.listdir(subset_dir)
+                                      if os.path.isfile(os.path.join(subset_dir, f)))
+                        print(f"[INFO] subset {subset_name} verified in Tigris ({n_files} files).")
+                    else:
+                        print(f"[INFO] Tigris upload skipped for subset {subset_name}.")
+
+                    print(f"[INFO] subset {subset_name} complete.")
+        finally:
+            pool.close()
+            pool.join()
+
+    _write_logs(all_logs, subset_log_path)
 
 if __name__ == "__main__":
     import tempfile
@@ -455,7 +832,30 @@ if __name__ == "__main__":
                         default=0.0,
                         help="Global and yt-dlp sleep interval upper bound")
 
+    parser.add_argument("--tigris_bucket",
+                        type=str,
+                        default=None,
+                        help="Tigris bucket to upload completed subsets to (default: env TIGRIS_BUCKET or 'genau-dataset')")
+
+    parser.add_argument("--tigris_endpoint",
+                        type=str,
+                        default=None,
+                        help="Tigris S3 endpoint URL (default: env AWS_ENDPOINT_URL / TIGRIS_ENDPOINT_URL or https://t3.storage.dev)")
+
+    parser.add_argument("--skip_tigris_upload",
+                        action='store_true',
+                        help="Do not upload subsets to Tigris; keep them only on local disk")
+
+    parser.add_argument("--max_retry_rounds",
+                        type=int,
+                        default=3,
+                        help="Max probe rounds to retry transient (e.g. rate-limit) download errors per subset")
+
     args = parser.parse_args()
+
+    # Load Tigris credentials/config from a .env file in the current directory
+    # (real env vars already set in the shell still take precedence).
+    load_dotenv()
 
     with tempfile.TemporaryDirectory() as temp_dir:
         if args.input_file is None or not os.path.exists(args.input_file):
@@ -479,5 +879,9 @@ if __name__ == "__main__":
                                 max_sleep_interval=args.max_sleep_interval,
                                 resume=not args.redownload,
                                 files_per_folder=args.files_per_folder,
-                                num_processes=args.num_processes
+                                num_processes=args.num_processes,
+                                upload_to_tigris=not args.skip_tigris_upload,
+                                tigris_bucket=args.tigris_bucket,
+                                tigris_endpoint=args.tigris_endpoint,
+                                max_retry_rounds=args.max_retry_rounds
         )
