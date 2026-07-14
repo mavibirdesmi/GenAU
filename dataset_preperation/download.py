@@ -187,7 +187,7 @@ def _list_remote_subset(s3, bucket, subset_name):
     remote = {}
     prefix = f"{subset_name}/"
     paginator = s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+    for page in tqdm(paginator.paginate(Bucket=bucket, Prefix=prefix), desc=f"[Tigris] list {subset_name}", leave=False):
         for obj in page.get("Contents", []):
             fname = obj["Key"][len(prefix):]
             if fname:
@@ -198,7 +198,7 @@ def _list_remote_subset(s3, bucket, subset_name):
 def verify_subset_in_tigris(s3, bucket, subset_dir, subset_name):
     """Return (missing, size_mismatch, extra) lists comparing the local subset folder to Tigris."""
     local = {}
-    for fname in sorted(os.listdir(subset_dir)):
+    for fname in tqdm(sorted(os.listdir(subset_dir)), desc=f"[Tigris] verify {subset_name}", leave=False):
         fpath = os.path.join(subset_dir, fname)
         if os.path.isfile(fpath):
             local[fname] = os.path.getsize(fpath)
