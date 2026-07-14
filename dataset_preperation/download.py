@@ -80,6 +80,11 @@ TIGRIS_DEFAULT_BUCKET = "genau-dataset"
 TIGRIS_DEFAULT_MANIFEST_BUCKET = "genau-dataset-manifests"
 SUBSET_NAME_RE = re.compile(r"^\d{6}$")
 SHA256_MANIFEST_NAME = "sha256sum.txt"
+FILE_LIST_NAME = "files.json"  # per-subset directory inventory uploaded to the manifest bucket
+# Matches a clip file "<video_id>_<idx:03d>.<ext>" or a permanent-error file "<video_id>.error.json",
+# capturing the video_id (video_ids may contain underscores, so the clip index is the LAST _NNN).
+CLIP_FILE_RE = re.compile(r"^(.+)_(\d{3})\.(?:mp4|wav|json)$")
+ERROR_FILE_RE = re.compile(r"^(.+)\.error\.json$")
 
 
 def _env(*names, default=None):
@@ -122,20 +127,31 @@ def compute_subset_sha256(subset_dir, manifest_name=SHA256_MANIFEST_NAME):
 
     The manifest is written to <subset_dir>/<manifest_name> in the same format as the
     `sha256sum` coreutil: "<hexdigest>  <filename>". The manifest file itself is excluded.
+    Progress is reported as bytes processed (smooth even for large media files).
     """
-    entries = []
+    # gather the files to hash and their sizes first, so we can show byte-accurate progress
+    to_hash = []
     for fname in sorted(os.listdir(subset_dir)):
         fpath = os.path.join(subset_dir, fname)
         if not os.path.isfile(fpath) or fname == manifest_name:
             continue
-        digest = hashlib.sha256()
-        with open(fpath, "rb") as handle:
-            while True:
-                chunk = handle.read(1 << 20)
-                if not chunk:
-                    break
-                digest.update(chunk)
-        entries.append(f"{digest.hexdigest()}  {fname}")
+        to_hash.append((fname, fpath, os.path.getsize(fpath)))
+
+    entries = []
+    total = sum(size for _name, _path, size in to_hash)
+    label = os.path.basename(subset_dir.rstrip(os.sep)) or "subset"
+    with tqdm(total=total, unit="B", unit_scale=True, unit_divisor=1024,
+              desc=f"[sha256] {label}", leave=False) as bar:
+        for fname, fpath, _size in to_hash:
+            digest = hashlib.sha256()
+            with open(fpath, "rb") as handle:
+                while True:
+                    chunk = handle.read(1 << 20)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    bar.update(len(chunk))
+            entries.append(f"{digest.hexdigest()}  {fname}")
     manifest_path = os.path.join(subset_dir, manifest_name)
     with open(manifest_path, "w") as handle:
         handle.write("\n".join(entries) + ("\n" if entries else ""))
@@ -198,6 +214,29 @@ def upload_subset_to_tigris(s3, data_bucket, manifest_bucket, subset_dir, subset
             _upload_file_with_retry(s3, data_bucket, fpath, key)
     if skipped:
         print(f"[INFO] subset {subset_name}: {skipped}/{len(ordered)} data object(s) already present in Tigris; skipped.")
+    # also store a small directory inventory in the (hot) manifest bucket for later sanity checks
+    upload_subset_file_list(s3, manifest_bucket, subset_name, local)
+
+
+def upload_subset_file_list(s3, manifest_bucket, subset_name, files_with_sizes,
+                             file_list_name=FILE_LIST_NAME):
+    """Upload a JSON inventory of the subset folder (name + size per file, plus count and total)
+    to the manifest bucket. Non-critical: a failure only warns (the sha256sum manifest is the
+    authoritative record used for skip/verify).
+    """
+    items = sorted(files_with_sizes.items())
+    payload = {
+        "subset": subset_name,
+        "count": len(items),
+        "total_size": sum(size for _name, size in items),
+        "files": [{"name": name, "size": size} for name, size in items],
+    }
+    body = json.dumps(payload, indent=2)
+    try:
+        s3.put_object(Bucket=manifest_bucket, Key=f"{subset_name}/{file_list_name}",
+                      Body=body.encode("utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[WARN] could not upload file list for subset {subset_name} to manifest bucket: {exc}")
 
 
 def _list_remote_subset(s3, bucket, subset_name):
@@ -324,6 +363,88 @@ def remove_lowest_index_subset(save_dir, current_subset_name, manifest_name=SHA2
         except OSError:
             pass
     return lowest
+
+
+# --------------------------------------------------------------------------------------------------
+# Local subset-construction check
+# --------------------------------------------------------------------------------------------------
+#
+# A previous run (e.g. with a different --files_per_folder, or a partial/interrupted run) can leave
+# clip files in the wrong subset folder. If such a "stray" file is uploaded, it lands under the
+# wrong subset in Tigris and the subset's sha256sum manifest silently includes it. Before
+# downloading/uploading a subset we therefore verify that every clip/error file in its folder
+# actually belongs to that subset (its video_id is one of the subset's videos).
+
+def parse_clip_video_id(fname):
+    """Return the video_id embedded in a clip/error filename, or None for non-clip files."""
+    m = CLIP_FILE_RE.match(fname)
+    if m:
+        return m.group(1)
+    m = ERROR_FILE_RE.match(fname)
+    if m:
+        return m.group(1)
+    return None
+
+
+def build_video_to_subset_map(all_entries, files_per_folder):
+    """Map each video_id -> its correct 6-digit subset name (based on global video index)."""
+    vid_to_subset = {}
+    for video_idx, (video_id, _info) in all_entries:
+        vid_to_subset[video_id] = f"{video_idx // files_per_folder:06d}"
+    return vid_to_subset
+
+
+def find_stray_files(subset_dir, subset_entries):
+    """Return clip/error files in the subset folder whose video_id does NOT belong to this subset.
+
+    These are videos misplaced from other subsets by previous runs. Non-clip files (the manifest,
+    .DS_Store, etc.) are ignored.
+    """
+    vids = {entry[1][0] for entry in subset_entries}
+    strays = []
+    if not os.path.isdir(subset_dir):
+        return strays
+    for fname in os.listdir(subset_dir):
+        vid = parse_clip_video_id(fname)
+        if vid is not None and vid not in vids:
+            strays.append(fname)
+    return sorted(strays)
+
+
+def reorganize_local_subsets(save_dir, vid_to_subset):
+    """One-time pass: move every misplaced clip/error file into its correct subset folder.
+
+    Use BEFORE uploading any subsets to Tigris (e.g. on the first Tigris run after an older run
+    with a different --files_per_folder). Moving a file into a subset that is already uploaded to
+    Tigris would desync the local copy from the remote manifest, so don't run this after uploads.
+    Returns (moved, skipped) where skipped covers out-of-range videos and name conflicts.
+    """
+    moved = 0
+    skipped = 0
+    for name in os.listdir(save_dir):
+        sub = os.path.join(save_dir, name)
+        if not os.path.isdir(sub) or not SUBSET_NAME_RE.match(name):
+            continue
+        for fname in os.listdir(sub):
+            vid = parse_clip_video_id(fname)
+            if vid is None:
+                continue  # manifest / junk -> leave it
+            correct = vid_to_subset.get(vid)
+            if correct is None:
+                skipped += 1  # video not in this run's dataset range -> can't place it
+                continue
+            if correct == name:
+                continue  # already in the right folder
+            dst_dir = os.path.join(save_dir, correct)
+            os.makedirs(dst_dir, exist_ok=True)
+            dst = os.path.join(dst_dir, fname)
+            if os.path.exists(dst):
+                skipped += 1  # conflict; don't overwrite
+                continue
+            shutil.move(os.path.join(sub, fname), dst)
+            moved += 1
+    return moved, skipped
+
 
 
 def show_disk_usage():
@@ -675,6 +796,7 @@ def download_audioset_split(json_file,
                             tigris_manifest_bucket=TIGRIS_DEFAULT_MANIFEST_BUCKET,
                             tigris_endpoint=None,
                             max_retry_rounds=3,
+                            reorganize_local=False,
                             subset_log_path="download_logs.txt",
                             ):
 
@@ -712,6 +834,15 @@ def download_audioset_split(json_file,
     print(f"[INFO] {len(all_entries)} videos grouped into {len(sorted_subset_idxs)} subsets "
           f"(files_per_folder={files_per_folder}): "
           f"{sorted_subset_idxs[0]:06d}..{sorted_subset_idxs[-1]:06d}")
+
+    # Map every video_id to the subset folder it belongs in, used to detect/relocate stray files.
+    vid_to_subset = build_video_to_subset_map(all_entries, files_per_folder)
+    if reorganize_local:
+        print("[INFO] Reorganizing local subset folders (moving misplaced clips to their "
+              f"correct subsets). Use this BEFORE uploading subsets to Tigris.")
+        moved, skipped = reorganize_local_subsets(save_dir, vid_to_subset)
+        print(f"[INFO] Reorganize done: {moved} file(s) moved, {skipped} skipped "
+              f"(out-of-range videos / name conflicts).")
 
     s3 = get_tigris_client(tigris_endpoint) if upload_to_tigris else None
     if upload_to_tigris:
@@ -771,6 +902,23 @@ def download_audioset_split(json_file,
                               f"matches local); skipping download & upload.")
                         pbar.update(len(subset_entries))
                         continue
+
+                    # ------------------------------------------------------------------
+                    # 0.5. Local-construction check: refuse to download/upload a subset folder
+                    #      that contains clip files belonging to OTHER subsets (misplaced by a
+                    #      previous run, e.g. with a different --files_per_folder). Run once with
+                    #      --reorganize_local to fix, or remove the stray files manually.
+                    # ------------------------------------------------------------------
+                    strays = find_stray_files(subset_dir, subset_entries)
+                    if strays:
+                        preview = ", ".join(strays[:5]) + ("..." if len(strays) > 5 else "")
+                        print(f"[ERROR] subset {subset_name} is not correctly constructed: "
+                              f"{len(strays)} file(s) belong to other subsets (e.g. {preview}). "
+                              f"Refusing to upload a contaminated subset. "
+                              f"Run with --reorganize_local to move them to the right subsets, "
+                              f"or remove them manually, then rerun.")
+                        _write_logs(all_logs, subset_log_path)
+                        return
 
                     # ------------------------------------------------------------------
                     # 1-2. Download subset, probing transient (rate-limit) errors again.
@@ -1008,6 +1156,10 @@ if __name__ == "__main__":
                         default=3,
                         help="Max probe rounds to retry transient (e.g. rate-limit) download errors per subset")
 
+    parser.add_argument("--reorganize_local",
+                        action='store_true',
+                        help="One-time pass BEFORE downloading: move clip files sitting in the wrong subset folder (from a previous run with a different --files_per_folder) into their correct subset folder. Use BEFORE uploading subsets to Tigris.")
+
     args = parser.parse_args()
 
     # Load Tigris credentials/config from a .env file in the current directory
@@ -1041,5 +1193,6 @@ if __name__ == "__main__":
                                 tigris_bucket=args.tigris_bucket,
                                 tigris_manifest_bucket=args.tigris_manifest_bucket,
                                 tigris_endpoint=args.tigris_endpoint,
-                                max_retry_rounds=args.max_retry_rounds
+                                max_retry_rounds=args.max_retry_rounds,
+                                reorganize_local=args.reorganize_local
         )
