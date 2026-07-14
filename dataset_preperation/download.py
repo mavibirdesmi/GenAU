@@ -151,12 +151,36 @@ def _upload_file_with_retry(s3, bucket, local_path, key, max_retries=3):
 
 
 def upload_subset_to_tigris(s3, bucket, subset_dir, subset_name, manifest_name=SHA256_MANIFEST_NAME):
-    """Upload every file in the local subset folder to <bucket>/<subset_name>/<filename>."""
-    for fname in tqdm(sorted(os.listdir(subset_dir)), desc=f"[Tigris] upload {subset_name}", leave=False):
+    """Upload local subset files to <bucket>/<subset_name>/<filename>, skipping objects that
+    already exist in Tigris with a matching size (so resumed runs don't re-upload identical files).
+
+    The manifest is uploaded last so its remote presence is a stronger completion signal.
+    """
+    local = {}
+    for fname in sorted(os.listdir(subset_dir)):
         fpath = os.path.join(subset_dir, fname)
-        if not os.path.isfile(fpath):
-            continue
-        _upload_file_with_retry(s3, bucket, fpath, f"{subset_name}/{fname}")
+        if os.path.isfile(fpath):
+            local[fname] = os.path.getsize(fpath)
+    if not local:
+        return
+
+    remote = _list_remote_subset(s3, bucket, subset_name)
+    # data files first (sorted), then the manifest last
+    ordered = [f for f in sorted(local) if f != manifest_name]
+    if manifest_name in local:
+        ordered.append(manifest_name)
+
+    skipped = 0
+    with tqdm(ordered, desc=f"[Tigris] upload {subset_name}", leave=False) as bar:
+        for fname in bar:
+            fpath = os.path.join(subset_dir, fname)
+            if fname in remote and remote[fname] == local[fname]:
+                skipped += 1  # already present remotely with matching size
+                continue
+            _upload_file_with_retry(s3, bucket, fpath, f"{subset_name}/{fname}")
+    if skipped:
+        print(f"[INFO] subset {subset_name}: {skipped}/{len(ordered)} object(s) already present "
+              f"in Tigris and were skipped.")
 
 
 def _list_remote_subset(s3, bucket, subset_name):
@@ -183,6 +207,40 @@ def verify_subset_in_tigris(s3, bucket, subset_dir, subset_name):
     size_mismatch = sorted(f for f in local if f in remote and remote[f] != local[f])
     extra = sorted(f for f in remote if f not in local)
     return missing, size_mismatch, extra
+
+
+def remote_subset_complete(s3, bucket, subset_name, manifest_name=SHA256_MANIFEST_NAME):
+    """Best-effort check that a subset is already fully uploaded to Tigris.
+
+    Used to skip a subset on resume when the local folder no longer exists (e.g. after it was
+    pruned to free disk space) but was previously uploaded. The subset is considered complete if
+    a sha256sum manifest exists remotely AND every file listed in that manifest is present
+    remotely. Content checksums are not re-verified.
+    """
+    try:
+        remote = _list_remote_subset(s3, bucket, subset_name)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[WARN] could not list remote subset {subset_name}: {exc}")
+        return False
+    if not remote or manifest_name not in remote:
+        return False
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=f"{subset_name}/{manifest_name}")
+        body = obj["Body"].read().decode("utf-8", errors="replace")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[WARN] could not read remote manifest for {subset_name}: {exc}")
+        return False
+    expected = set()
+    for line in body.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 1)  # "<hash>  <filename>"
+        if len(parts) == 2:
+            expected.add(parts[1].strip())
+    if not expected:
+        return False
+    return expected.issubset(set(remote.keys()))
 
 
 def remove_lowest_index_subset(save_dir, current_subset_name):
@@ -622,6 +680,25 @@ def download_audioset_split(json_file,
                     entry_by_idx = {e[0]: e for e in subset_entries}
                     pbar.set_postfix_str(f"subset={subset_name} n={len(subset_entries)}")
                     print(f"\n[INFO] === Subset {subset_name}: {len(subset_entries)} videos ===")
+
+                    # ------------------------------------------------------------------
+                    # 0. Resume: skip subsets already fully backed up to Tigris so we neither
+                    #    re-download nor re-upload identical objects.
+                    # ------------------------------------------------------------------
+                    if upload_to_tigris:
+                        if os.path.isdir(subset_dir):
+                            _missing, _sm, _extra = verify_subset_in_tigris(
+                                s3, tigris_bucket, subset_dir, subset_name)
+                            if not _missing and not _sm and not _extra:
+                                print(f"[INFO] subset {subset_name} already matches Tigris; "
+                                      f"skipping download & upload.")
+                                pbar.update(len(subset_entries))
+                                continue
+                        if remote_subset_complete(s3, tigris_bucket, subset_name):
+                            print(f"[INFO] subset {subset_name} already complete in Tigris; "
+                                  f"skipping download & upload.")
+                            pbar.update(len(subset_entries))
+                            continue
 
                     # ------------------------------------------------------------------
                     # 1-2. Download subset, probing transient (rate-limit) errors again.
