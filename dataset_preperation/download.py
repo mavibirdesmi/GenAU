@@ -29,6 +29,7 @@ RATE_LIMIT_ERROR_PATTERNS = (
 )
 PERMANENT_VIDEO_ERROR_PATTERNS = (
     "video unavailable",
+    "this video is not available"
     "this video is unavailable",
     "private video",
     "video has been removed",
