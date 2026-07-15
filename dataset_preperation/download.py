@@ -661,7 +661,7 @@ def download_yt_video(entry,
                 'external_downloader':'ffmpeg',
                 'download_ranges': yt_dlp.utils.download_range_func([], [[start, to]]),
                 'force-keyframe-at-cuts': True,
-                'external_downloader_args':['-loglevel', 'quiet'],
+                'external_downloader_args':['-loglevel', 'error'],
                 "remote_components": ["ejs:github"],
                 "cookiesfrombrowser": ("firefox",),
             }
