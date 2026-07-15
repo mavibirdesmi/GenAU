@@ -687,7 +687,9 @@ def download_yt_video(entry,
                 'external_downloader':'ffmpeg',
                 'download_ranges': yt_dlp.utils.download_range_func([], [[start, to]]),
                 'force_keyframe_at_cuts': True,
-                'external_downloader_args':['-loglevel', 'error'],
+                'external_downloader_args': {
+                    'ffmpeg': ['-loglevel', 'error'],
+                },
                 "remote_components": ["ejs:github"],
                 "cookiesfrombrowser": ("firefox",),
             }
@@ -709,13 +711,14 @@ def download_yt_video(entry,
                                                 'preferedformat': 'mp4',  # Ensure the output is MP4
                                                 }]
             if proxy is not None:
-                ydl_opts['proxy'] = f'http://127.0.0.1:{proxy}/'
-                ydl_opts["external_downloader_args"].extend([
-                    "-http_proxy",
-                    f"http://127.0.0.1:{proxy}",
-                    "-loglevel",
-                    "error",
-                ])
+                proxy_url = normalize_proxy_url(proxy)
+                ydl_opts['proxy'] = proxy_url
+                parsed_proxy = urlparse(proxy_url)
+                if parsed_proxy.scheme.lower() in ("http", "https"):
+                    ydl_opts["external_downloader_args"]["ffmpeg_i"] = [
+                        "-http_proxy",
+                        proxy_url,
+                    ]
 
             url = f'https://www.youtube.com/watch?v={video_id}'
             temp_clip_dir = f'{temp_working_dir}/id_{video_id}_{file_idx:03d}'
