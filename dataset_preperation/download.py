@@ -916,6 +916,17 @@ def resolve_input_row_bounds(start_idx=None, end_idx=None, files_per_folder=5000
     return 0, DEFAULT_END_IDX
 
 
+def range_selector_is_used(start_idx=None, end_idx=None,
+                           subset=None, subset_start=None, subset_end=None):
+    return (
+        start_idx is not None
+        or end_idx is not None
+        or subset is not None
+        or subset_start is not None
+        or subset_end is not None
+    )
+
+
 def download_audioset_split(json_file,
                             save_dir,
                             temp_working_dir,
@@ -964,6 +975,10 @@ def download_audioset_split(json_file,
 
     num_processes = num_processes or os.cpu_count() or 1
     tigris_upload_workers = max(1, int(tigris_upload_workers or 1))
+    if reorganize_local and range_selector_is_used(start_idx, end_idx, subset, subset_start, subset_end):
+        raise ValueError("--reorganize_local scans all local subset folders and can delete files "
+                         "outside the selected range. Run it without --start_idx/--end_idx, "
+                         "--subset, or --subset_start/--subset_end.")
     start_idx, end_idx = resolve_input_row_bounds(
         start_idx=start_idx,
         end_idx=end_idx,
@@ -1045,7 +1060,7 @@ def download_audioset_split(json_file,
         pool = ctx.Pool(num_processes * 2, initializer=_init_pool_worker,
                         initargs=(download_audio_split,))
         try:
-            with tqdm(total=len(all_entries), desc="download") as pbar:
+            with tqdm(total=len(all_entries), desc="videos", unit="video") as pbar:
                 for subset_idx in sorted_subset_idxs:
                     subset_name = f"{subset_idx:06d}"
                     subset_dir = os.path.join(save_dir, subset_name)
@@ -1362,6 +1377,13 @@ if __name__ == "__main__":
                                  subset_end=args.subset_end)
     except ValueError as exc:
         parser.error(str(exc))
+    if args.reorganize_local and range_selector_is_used(args.start_idx, args.end_idx,
+                                                        args.subset,
+                                                        args.subset_start,
+                                                        args.subset_end):
+        parser.error("--reorganize_local scans all local subset folders and can delete files "
+                     "outside the selected range. Run it without --start_idx/--end_idx, "
+                     "--subset, or --subset_start/--subset_end.")
     if args.start_idx is not None and args.end_idx is not None:
         print("[WARN] --start_idx/--end_idx is a legacy raw-row selector. "
               "Prefer --subset for one 6-digit folder, or "
