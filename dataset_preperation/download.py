@@ -14,6 +14,7 @@ import hashlib
 import errno
 import re
 import subprocess
+from urllib.parse import urlparse
 import boto3
 from botocore.config import Config
 from dotenv import load_dotenv
@@ -59,6 +60,23 @@ def is_permanent_video_error(error_text):
     if is_rate_limit_error(lowered):
         return False
     return any(pattern in lowered for pattern in PERMANENT_VIDEO_ERROR_PATTERNS)
+
+
+def normalize_proxy_url(proxy):
+    if proxy is None:
+        return None
+
+    proxy = proxy.strip()
+    if not proxy:
+        return None
+
+    if re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*://', proxy):
+        return proxy
+
+    if proxy.isdigit():
+        return f'socks5://127.0.0.1:{proxy}/'
+
+    return f'http://{proxy}'
 
 
 # --------------------------------------------------------------------------------------------------
@@ -683,15 +701,13 @@ def download_yt_video(entry,
                                                 'preferedformat': 'mp4',  # Ensure the output is MP4
                                                 }]
             if proxy is not None:
-                ydl_opts['proxy'] = f'socks5://127.0.0.1:{proxy}/'
-                ydl_opts["external_downloader_args"] = {
-                    "ffmpeg_i": [
-                        "-http_proxy",
-                        f"http://127.0.0.1:{proxy}",
-                        "-loglevel",
-                        "error",
-                    ],
-                },
+                ydl_opts['proxy'] = f'http://127.0.0.1:{proxy}/'
+                ydl_opts["external_downloader_args"].extend([
+                    "-http_proxy",
+                    f"http://127.0.0.1:{proxy}",
+                    "-loglevel",
+                    "error",
+                ])
 
             url = f'https://www.youtube.com/watch?v={video_id}'
             temp_clip_dir = f'{temp_working_dir}/id_{video_id}_{file_idx:03d}'
@@ -1275,7 +1291,9 @@ if __name__ == "__main__":
     parser.add_argument("--proxy",
                         type=str,
                         default=None,
-                        help="provde a proxy port to bypass youtube blocking your IP")
+                        help="Proxy URL for yt-dlp/ffmpeg, e.g. http://127.0.0.1:8118 "
+                             "(Privoxy) or socks5://127.0.0.1:1080. A bare port keeps the "
+                             "legacy behavior and is treated as socks5://127.0.0.1:<port>/")
 
     parser.add_argument("--files_per_folder",
                         type=int,
