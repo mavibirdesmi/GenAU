@@ -660,9 +660,16 @@ def download_yt_video(entry,
         if resume and os.path.isfile(clip_json_path):
             continue
         else:
-            ytdl_logger = logging.getLogger()
             log_stream = StringIO()
-            logging.basicConfig(stream=log_stream, level=logging.INFO)
+            logger_name = f"yt_dlp.{os.getpid()}.{video_id}.{file_idx}"
+            ytdl_logger = logging.getLogger(logger_name)
+            ytdl_logger.handlers.clear()
+            ytdl_logger.setLevel(logging.DEBUG)
+            ytdl_logger.propagate = False
+            log_handler = logging.StreamHandler(log_stream)
+            log_handler.setLevel(logging.DEBUG)
+            log_handler.setFormatter(logging.Formatter("%(message)s"))
+            ytdl_logger.addHandler(log_handler)
 
             out_file_ext = 'wav' if audio_only else 'mp4'
             format = 'bestaudio/best' if audio_only else 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio'
@@ -671,6 +678,7 @@ def download_yt_video(entry,
                 'outtmpl': f"{temp_working_dir}/id_{video_id}_{file_idx:03d}/audio.%(ext)s",
                 'format': format,
                 'quiet': True,
+                'verbose': True,
                 'ignoreerrors': False,
                 # 'writesubtitles': True,  # Attempt to download subtitles (transcripts)
                 # 'writeautomaticsub': True,  # Attempt to download automatic subtitles (auto-generated transcripts)
@@ -755,7 +763,14 @@ def download_yt_video(entry,
                 shutil.rmtree(temp_clip_dir, ignore_errors=True)
             except Exception as e:
                 shutil.rmtree(temp_clip_dir, ignore_errors=True)
-                error_text = f'{url} - ytdl : {log_stream.getvalue()}, system : {str(e)}'
+                log_text = log_stream.getvalue()
+                ffmpeg_debug_line = next(
+                    (line for line in log_text.splitlines() if 'ffmpeg command line:' in line.lower()),
+                    None,
+                )
+                if ffmpeg_debug_line is not None:
+                    print(f"[DEBUG] {ffmpeg_debug_line}")
+                error_text = f'{url} - ytdl : {log_text}, system : {str(e)}'
                 if is_out_of_storage_error(e, error_text):
                     print(f"[FATAL] out of storage while downloading {clip_json_path}: {e}")
                     return f"{NOSPACE_MARKER}: {error_text}"
@@ -783,6 +798,9 @@ def download_yt_video(entry,
                 else:
                     print(f"[ERROR] downloading {clip_json_path}:", e)
                 return error_text
+            finally:
+                ytdl_logger.removeHandler(log_handler)
+                log_handler.close()
     return None
 
 def read_video_segments_info(local_input_video_segments,
