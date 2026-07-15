@@ -764,12 +764,21 @@ def download_yt_video(entry,
             except Exception as e:
                 shutil.rmtree(temp_clip_dir, ignore_errors=True)
                 log_text = log_stream.getvalue()
-                ffmpeg_debug_line = next(
-                    (line for line in log_text.splitlines() if 'ffmpeg command line:' in line.lower()),
-                    None,
-                )
-                if ffmpeg_debug_line is not None:
-                    print(f"[DEBUG] {ffmpeg_debug_line}")
+                ffmpeg_debug_lines = []
+                collecting_ffmpeg_debug = False
+                for line in log_text.splitlines():
+                    if 'ffmpeg command line:' in line.lower():
+                        collecting_ffmpeg_debug = True
+                    if collecting_ffmpeg_debug:
+                        ffmpeg_debug_lines.append(line)
+                        if line.strip().endswith('.part"') or line.strip().endswith(".part'"):
+                            break
+                if ffmpeg_debug_lines:
+                    printable_ffmpeg_debug = "\\n".join(
+                        line.replace("\r", "\\r").replace("\n", "\\n")
+                        for line in ffmpeg_debug_lines
+                    )
+                    print(f"[DEBUG] {printable_ffmpeg_debug}")
                 error_text = f'{url} - ytdl : {log_text}, system : {str(e)}'
                 if is_out_of_storage_error(e, error_text):
                     print(f"[FATAL] out of storage while downloading {clip_json_path}: {e}")
