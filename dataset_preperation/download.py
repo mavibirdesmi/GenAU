@@ -8,12 +8,14 @@ from io import StringIO
 import json
 import argparse
 from functools import partial
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import hashlib
 import errno
 import re
 import subprocess
 import boto3
+from botocore.config import Config
 from dotenv import load_dotenv
 from download_manager import get_dataset_json_file, dataset_urls
 
@@ -81,6 +83,7 @@ TIGRIS_DEFAULT_MANIFEST_BUCKET = "genau-dataset-manifests"
 SUBSET_NAME_RE = re.compile(r"^\d{6}$")
 SHA256_MANIFEST_NAME = "sha256sum.txt"
 FILE_LIST_NAME = "files.json"  # per-subset directory inventory uploaded to the manifest bucket
+DEFAULT_END_IDX = int(1e9)
 # Matches a clip file "<video_id>_<idx:03d>.<ext>" or a permanent-error file "<video_id>.error.json",
 # capturing the video_id (video_ids may contain underscores, so the clip index is the LAST _NNN).
 CLIP_FILE_RE = re.compile(r"^(.+)_(\d{3})\.(?:mp4|wav|json)$")
@@ -143,7 +146,7 @@ def is_out_of_storage_error(exc=None, error_text=""):
     return "no space left on device" in lowered or "enospc" in lowered
 
 
-def get_tigris_client(endpoint_url=None, region_name=None):
+def get_tigris_client(endpoint_url=None, region_name=None, max_pool_connections=10):
     """Create an S3-compatible client pointed at Tigris.
 
     Endpoint, region and credentials are resolved from environment variables (loaded from a
@@ -154,7 +157,11 @@ def get_tigris_client(endpoint_url=None, region_name=None):
     region = region_name or _env("AWS_REGION", "TIGRIS_REGION", "AWS_DEFAULT_REGION") or "auto"
     access_key = _env("AWS_ACCESS_KEY_ID", "TIGRIS_ACCESS_KEY_ID")
     secret_key = _env("AWS_SECRET_ACCESS_KEY", "TIGRIS_SECRET_ACCESS_KEY")
-    kwargs = {"endpoint_url": endpoint, "region_name": region}
+    kwargs = {
+        "endpoint_url": endpoint,
+        "region_name": region,
+        "config": Config(max_pool_connections=max_pool_connections),
+    }
     if access_key and secret_key:
         kwargs["aws_access_key_id"] = access_key
         kwargs["aws_secret_access_key"] = secret_key
@@ -211,17 +218,18 @@ def _upload_file_with_retry(s3, bucket, local_path, key, max_retries=3):
 
 
 def upload_subset_to_tigris(s3, data_bucket, manifest_bucket, subset_dir, subset_name,
-                            manifest_name=SHA256_MANIFEST_NAME):
+                            manifest_name=SHA256_MANIFEST_NAME, upload_workers=32,
+                            skip_remote_listing=False):
     """Upload a subset to Tigris, split across two buckets:
 
       - data files (media + json) -> <data_bucket>/<subset_name>/<filename>
       - the sha256sum manifest    -> <manifest_bucket>/<subset_name>/<manifest_name>
 
-    Data files already present in the data bucket with a matching size are skipped (single
-    prefix listing, no local log). The manifest is always (re-)uploaded last (overwriting
-    whatever is there) so the manifest bucket always holds the latest checksums. Keeping the
-    manifest in its own (hot) bucket means archived data objects never have to be restored for
-    skip/verify reads.
+    By default, data files already present in the data bucket with a matching size are skipped
+    after a single prefix listing. The listing can be skipped for known-empty remote prefixes.
+    The manifest is always (re-)uploaded last (overwriting whatever is there) so the manifest
+    bucket always holds the latest checksums. Keeping the manifest in its own (hot) bucket means
+    archived data objects never have to be restored for skip/verify reads.
     """
     local = {}
     for fname in sorted(os.listdir(subset_dir)):
@@ -231,28 +239,57 @@ def upload_subset_to_tigris(s3, data_bucket, manifest_bucket, subset_dir, subset
     if not local:
         return
 
-    remote = _list_remote_subset(s3, data_bucket, subset_name)
-    # data files first (sorted), then the manifest last
-    ordered = [f for f in sorted(local) if f != manifest_name]
-    if manifest_name in local:
-        ordered.append(manifest_name)
-
+    remote = {} if skip_remote_listing else _list_remote_subset(s3, data_bucket, subset_name)
+    if skip_remote_listing:
+        print(f"[INFO] subset {subset_name}: skipping remote data listing; "
+              f"all local data objects will be uploaded.")
+    upload_workers = max(1, int(upload_workers or 1))
+    data_files = [f for f in sorted(local) if f != manifest_name]
+    to_upload = []
     skipped = 0
-    with tqdm(ordered, desc=f"[Tigris] upload {subset_name}", leave=False) as bar:
-        for fname in bar:
-            fpath = os.path.join(subset_dir, fname)
-            key = f"{subset_name}/{fname}"
-            if fname == manifest_name:
-                # manifest -> manifest bucket, always (re-)uploaded (overwrite)
-                _upload_file_with_retry(s3, manifest_bucket, fpath, key)
-                continue
-            # data file -> data bucket; skip if already present with a matching size
-            if remote.get(fname) == local[fname]:
-                skipped += 1
-                continue
-            _upload_file_with_retry(s3, data_bucket, fpath, key)
+    for fname in data_files:
+        # data file -> data bucket; skip if already present with a matching size
+        if remote.get(fname) == local[fname]:
+            skipped += 1
+        else:
+            to_upload.append(fname)
+
+    if to_upload:
+        print(f"[INFO] subset {subset_name}: uploading {len(to_upload)} data object(s) "
+              f"with {upload_workers} worker(s).")
+        if upload_workers == 1:
+            with tqdm(to_upload, desc=f"[Tigris] upload {subset_name}", leave=False) as bar:
+                for fname in bar:
+                    fpath = os.path.join(subset_dir, fname)
+                    key = f"{subset_name}/{fname}"
+                    _upload_file_with_retry(s3, data_bucket, fpath, key)
+        else:
+            with ThreadPoolExecutor(max_workers=upload_workers) as executor:
+                futures = {}
+                for fname in to_upload:
+                    fpath = os.path.join(subset_dir, fname)
+                    key = f"{subset_name}/{fname}"
+                    future = executor.submit(_upload_file_with_retry, s3, data_bucket, fpath, key)
+                    futures[future] = fname
+                with tqdm(total=len(futures), desc=f"[Tigris] upload {subset_name}", leave=False) as bar:
+                    for future in as_completed(futures):
+                        fname = futures[future]
+                        try:
+                            future.result()
+                        except Exception as exc:  # noqa: BLE001
+                            raise RuntimeError(f"failed to upload {subset_name}/{fname}") from exc
+                        bar.update()
+
     if skipped:
-        print(f"[INFO] subset {subset_name}: {skipped}/{len(ordered)} data object(s) already present in Tigris; skipped.")
+        print(f"[INFO] subset {subset_name}: {skipped}/{len(data_files)} data object(s) "
+              f"already present in Tigris; skipped.")
+
+    if manifest_name in local:
+        # manifest -> manifest bucket, always (re-)uploaded last (overwrite)
+        manifest_path = os.path.join(subset_dir, manifest_name)
+        _upload_file_with_retry(s3, manifest_bucket, manifest_path,
+                                f"{subset_name}/{manifest_name}")
+
     # also store a small directory inventory in the (hot) manifest bucket for later sanity checks
     upload_subset_file_list(s3, manifest_bucket, subset_name, local)
 
@@ -724,58 +761,69 @@ def download_yt_video(entry,
                 return error_text
     return None
 
-def update_interval_dict(dict_1, dict_2):
-    """
-    combine two dictionaries, and merge intervals list if it is replicated
-    """
-    for k, v in dict_2.items():
-        if k in dict_1:
-            dict_2[k]['intervals'] += dict_1[k]['intervals']
-
-    dict_1.update(dict_2)
-
 def read_video_segments_info(local_input_video_segments,
                              start_idx=0,
-                             end_idx=int(1e9),
+                             end_idx=DEFAULT_END_IDX,
                              min_audio_len=0.0,
-                            clap_threshold=0.0):
+                             clap_threshold=0.0):
+    """Read selected raw JSONL rows and return download entries keyed by raw row index.
+
+    `start_idx` is inclusive and `end_idx` is exclusive. The returned entries are shaped
+    like `(raw_idx, (video_id, info))`, matching the downloader's expected pool entries.
+    Keeping `raw_idx` prevents CLAP/min-length filtering from shifting subset folders.
+    """
     all_video_segments = {}
     total_number_of_clips = 0
+    selected_rows = 0
     with open(local_input_video_segments, 'r') as f:
-        last_idx = 0
         for idx, json_str in enumerate(tqdm(f, desc="parsing json input")):
-            if idx > start_idx:
-                try:
-                    json_str = json_str.strip()
-                    if json_str.endswith('\n'):
-                        json_str = json_str[:-1]
-                    if json_str.endswith(','):
-                        json_str = json_str[:-1]
-
-                    data = json.loads(json_str)
-                    video_ids = list(data.keys())
-                    if len(video_ids) == 0:
-                        continue
-                    video_id = video_ids[0]
-
-                    intervals = data[video_id].get("intervals", [])
-                    len_intervals_filtered = [clip for clip in intervals if float(clip['end']) - float(clip['start'])>= min_audio_len]
-                    clap_len_intervals_filtered = [clip for clip in len_intervals_filtered if  clip.get("CLAP_SIM", -9999) is not None and clip.get("CLAP_SIM", -9999) >= clap_threshold]
-                    total_number_of_clips += len(clap_len_intervals_filtered)
-                    video_data = {}
-                    video_data[video_id] = {}
-                    video_data[video_id]['intervals'] = clap_len_intervals_filtered
-                    update_interval_dict(all_video_segments, video_data)
-                except Exception as e:
-                    print("[ERROR] Couldn't parse json string:", json_str)
-                    continue
-                last_idx += 1
-
-            if last_idx >= end_idx:
+            if idx < start_idx:
+                continue
+            if idx >= end_idx:
                 break
 
+            try:
+                json_str = json_str.strip()
+                if json_str.endswith('\n'):
+                    json_str = json_str[:-1]
+                if json_str.endswith(','):
+                    json_str = json_str[:-1]
+
+                data = json.loads(json_str)
+                video_ids = list(data.keys())
+                if len(video_ids) == 0:
+                    continue
+                video_id = video_ids[0]
+
+                intervals = data[video_id].get("intervals", [])
+                len_intervals_filtered = [
+                    clip for clip in intervals
+                    if float(clip['end']) - float(clip['start']) >= min_audio_len
+                ]
+                clap_len_intervals_filtered = [
+                    clip for clip in len_intervals_filtered
+                    if clip.get("CLAP_SIM", -9999) is not None
+                    and clip.get("CLAP_SIM", -9999) >= clap_threshold
+                ]
+                total_number_of_clips += len(clap_len_intervals_filtered)
+                selected_rows += 1
+
+                if video_id not in all_video_segments:
+                    all_video_segments[video_id] = {
+                        "raw_idx": idx,
+                        "intervals": [],
+                    }
+                all_video_segments[video_id]["intervals"] += clap_len_intervals_filtered
+            except Exception:
+                print("[ERROR] Couldn't parse json string:", json_str)
+                continue
+
     print(f"Found {total_number_of_clips} audio clips.")
-    return all_video_segments
+    print(f"[INFO] Parsed {selected_rows} raw input row(s) in [{start_idx}, {end_idx}).")
+    return [
+        (info["raw_idx"], (video_id, {"intervals": info["intervals"]}))
+        for video_id, info in all_video_segments.items()
+    ]
 
 # Module-level worker glue so the spawn-based pool can map over entries while returning
 # which entry each result belongs to (needed to retry only the failed entries).
@@ -828,6 +876,46 @@ def _download_subset_via_pool(pool, subset_entries, pbar, counted_idxs):
     return results, nospace
 
 
+def resolve_input_row_bounds(start_idx=None, end_idx=None, files_per_folder=5000,
+                             subset=None, subset_start=None, subset_end=None):
+    """Resolve legacy row controls and preferred subset controls into raw JSONL row bounds."""
+    if files_per_folder <= 0:
+        raise ValueError("files_per_folder must be greater than 0")
+
+    legacy_args_used = start_idx is not None or end_idx is not None
+    single_subset_used = subset is not None
+    subset_range_used = subset_start is not None or subset_end is not None
+    range_modes_used = sum([legacy_args_used, single_subset_used, subset_range_used])
+    if range_modes_used > 1:
+        raise ValueError("Choose exactly one range selector: --start_idx with --end_idx, "
+                         "--subset, or --subset_start with --subset_end")
+
+    if legacy_args_used:
+        if start_idx is None or end_idx is None:
+            raise ValueError("--start_idx and --end_idx must be provided together")
+        if start_idx < 0:
+            raise ValueError("start_idx must be greater than or equal to 0")
+        if end_idx <= start_idx:
+            raise ValueError("end_idx must be greater than start_idx")
+        return start_idx, end_idx
+
+    if single_subset_used:
+        if subset < 0:
+            raise ValueError("subset must be greater than or equal to 0")
+        return subset * files_per_folder, (subset + 1) * files_per_folder
+
+    if subset_range_used:
+        if subset_start is None or subset_end is None:
+            raise ValueError("--subset_start and --subset_end must be provided together")
+        if subset_start < 0:
+            raise ValueError("subset_start must be greater than or equal to 0")
+        if subset_end <= subset_start:
+            raise ValueError("subset_end must be greater than subset_start")
+        return subset_start * files_per_folder, subset_end * files_per_folder
+
+    return 0, DEFAULT_END_IDX
+
+
 def download_audioset_split(json_file,
                             save_dir,
                             temp_working_dir,
@@ -835,8 +923,11 @@ def download_audioset_split(json_file,
                             audio_only=False,
                             proxy_port=None,
                             audio_sampling_rate=44100,
-                            start_idx=0,
-                            end_idx=int(1e9),
+                            start_idx=None,
+                            end_idx=None,
+                            subset=None,
+                            subset_start=None,
+                            subset_end=None,
                             num_processes=os.cpu_count(),
                             resume=True,
                             files_per_folder=5000,
@@ -851,6 +942,8 @@ def download_audioset_split(json_file,
                             tigris_bucket=TIGRIS_DEFAULT_BUCKET,
                             tigris_manifest_bucket=TIGRIS_DEFAULT_MANIFEST_BUCKET,
                             tigris_endpoint=None,
+                            tigris_upload_workers=32,
+                            skip_remote_listing=False,
                             max_retry_rounds=3,
                             reorganize_local=False,
                             subset_log_path="download_logs.txt",
@@ -870,15 +963,24 @@ def download_audioset_split(json_file,
         tigris_endpoint = _env("AWS_ENDPOINT_URL", "TIGRIS_ENDPOINT_URL")
 
     num_processes = num_processes or os.cpu_count() or 1
+    tigris_upload_workers = max(1, int(tigris_upload_workers or 1))
+    start_idx, end_idx = resolve_input_row_bounds(
+        start_idx=start_idx,
+        end_idx=end_idx,
+        files_per_folder=files_per_folder,
+        subset=subset,
+        subset_start=subset_start,
+        subset_end=subset_end,
+    )
+    print(f"[INFO] Raw input row range: [{start_idx}, {end_idx})")
 
-    all_video_segments = read_video_segments_info(json_file,
-                                                  start_idx=start_idx,
-                                                  end_idx=end_idx,
-                                                  min_audio_len=min_audio_len,
-                                                  clap_threshold=clap_threshold)
+    all_entries = read_video_segments_info(json_file,
+                                           start_idx=start_idx,
+                                           end_idx=end_idx,
+                                           min_audio_len=min_audio_len,
+                                           clap_threshold=clap_threshold)
 
     # Group the (video_idx, (video_id, info)) entries into subsets keyed by folder index.
-    all_entries = list(enumerate(all_video_segments.items(), start=start_idx))
     subsets = {}
     for entry in all_entries:
         subset_idx = entry[0] // files_per_folder
@@ -900,11 +1002,16 @@ def download_audioset_split(json_file,
         print(f"[INFO] Reorganize done: {moved} moved, {deleted} stray/conflict file(s) removed, "
               f"{junk_deleted} OS junk file(s) deleted (._*, .DS_Store, ...).")
 
-    s3 = get_tigris_client(tigris_endpoint) if upload_to_tigris else None
+    s3 = get_tigris_client(
+        tigris_endpoint,
+        max_pool_connections=max(10, tigris_upload_workers * 2),
+    ) if upload_to_tigris else None
     if upload_to_tigris:
         print(f"[INFO] Tigris uploads enabled: data bucket='{tigris_bucket}' "
               f"manifest bucket='{tigris_manifest_bucket}' "
               f"endpoint={tigris_endpoint or TIGRIS_DEFAULT_ENDPOINT}")
+        print(f"[INFO] Tigris data uploads use {tigris_upload_workers} worker(s) "
+              f"and {max(10, tigris_upload_workers * 2)} HTTP connection(s).")
         print("[INFO] Manifests are read from the (hot) manifest bucket; data objects are only "
               f"listed/uploaded (works on archived data buckets).")
     else:
@@ -1058,7 +1165,9 @@ def download_audioset_split(json_file,
                         print(f"[INFO] Uploading subset {subset_name}: data -> '{tigris_bucket}', "
                               f"manifest -> '{tigris_manifest_bucket}'...")
                         upload_subset_to_tigris(s3, tigris_bucket, tigris_manifest_bucket,
-                                                subset_dir, subset_name)
+                                                subset_dir, subset_name,
+                                                upload_workers=tigris_upload_workers,
+                                                skip_remote_listing=skip_remote_listing)
 
                         ok, details = verify_subset_in_tigris(
                             s3, tigris_manifest_bucket, subset_dir, subset_name)
@@ -1148,14 +1257,32 @@ if __name__ == "__main__":
     parser.add_argument("--files_per_folder",
                         type=int,
                         default=50000,
-                        help="How many files to store per folder")
+                        help="How many raw input rows map to each 6-digit subset folder")
 
     parser.add_argument('--start_idx', '-s',
-                        type=int, default=0,
-                        help="start index of the json objects in the provided files")
+                        type=int, default=None,
+                        help="Legacy raw JSONL row start index, inclusive. "
+                             "Must be used with --end_idx.")
 
-    parser.add_argument('--end_idx', '-e', type=int, default=int(1e9),
-                        help="start index of the json objects in the provided files")
+    parser.add_argument('--end_idx', '-e', type=int, default=None,
+                        help="Legacy raw JSONL row end index, exclusive. "
+                             "Must be used with --start_idx.")
+
+    parser.add_argument("--subset",
+                        type=int,
+                        default=None,
+                        help="Download/upload one 6-digit subset by raw row index "
+                             "(row range: subset * files_per_folder to next subset)")
+
+    parser.add_argument("--subset_start",
+                        type=int,
+                        default=None,
+                        help="First 6-digit subset index to process, inclusive")
+
+    parser.add_argument("--subset_end",
+                        type=int,
+                        default=None,
+                        help="Last 6-digit subset index to process, exclusive")
 
     parser.add_argument('--redownload', action='store_true',
                         help="redownload already downloaded files")
@@ -1203,6 +1330,17 @@ if __name__ == "__main__":
                         default=None,
                         help="Tigris S3 endpoint URL (default: env AWS_ENDPOINT_URL / TIGRIS_ENDPOINT_URL or https://t3.storage.dev)")
 
+    parser.add_argument("--tigris_upload_workers",
+                        type=int,
+                        default=32,
+                        help="Number of concurrent Tigris data-object uploads per subset")
+
+    parser.add_argument("--skip_remote_listing",
+                        action='store_true',
+                        help="Skip listing existing remote data objects before upload. Use only when "
+                             "the target subset prefix is known to be empty; otherwise existing "
+                             "objects are re-uploaded.")
+
     parser.add_argument("--skip_tigris_upload",
                         action='store_true',
                         help="Do not upload subsets to Tigris; keep them only on local disk")
@@ -1217,6 +1355,17 @@ if __name__ == "__main__":
                         help="One-time pass BEFORE downloading: move clip files sitting in the wrong subset folder (from a previous run with a different --files_per_folder) into their correct subset folder. Use BEFORE uploading subsets to Tigris.")
 
     args = parser.parse_args()
+    try:
+        resolve_input_row_bounds(args.start_idx, args.end_idx, args.files_per_folder,
+                                 subset=args.subset,
+                                 subset_start=args.subset_start,
+                                 subset_end=args.subset_end)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.start_idx is not None and args.end_idx is not None:
+        print("[WARN] --start_idx/--end_idx is a legacy raw-row selector. "
+              "Prefer --subset for one 6-digit folder, or "
+              "--subset_start/--subset_end for a range of folders.")
 
     # Load Tigris credentials/config from a .env file in the current directory
     # (real env vars already set in the shell still take precedence).
@@ -1235,6 +1384,9 @@ if __name__ == "__main__":
                                 proxy_port=args.proxy,
                                 start_idx=args.start_idx,
                                 end_idx=args.end_idx,
+                                subset=args.subset,
+                                subset_start=args.subset_start,
+                                subset_end=args.subset_end,
                                 clap_threshold=args.clap_threshold,
                                 min_audio_len=args.min_audio_len,
                                 max_videos_per_hour=args.max_videos_per_hour,
@@ -1249,6 +1401,8 @@ if __name__ == "__main__":
                                 tigris_bucket=args.tigris_bucket,
                                 tigris_manifest_bucket=args.tigris_manifest_bucket,
                                 tigris_endpoint=args.tigris_endpoint,
+                                tigris_upload_workers=args.tigris_upload_workers,
+                                skip_remote_listing=args.skip_remote_listing,
                                 max_retry_rounds=args.max_retry_rounds,
                                 reorganize_local=args.reorganize_local
         )
