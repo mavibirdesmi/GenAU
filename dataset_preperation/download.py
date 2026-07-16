@@ -783,6 +783,7 @@ def download_yt_video(entry,
                     )
                     print(f"[DEBUG] {printable_ffmpeg_debug}")
                 error_text = f'{url} - ytdl : {log_text}, system : {str(e)}'
+                print(f"[ERROR] downloading {clip_json_path}:", error_text)
                 if is_out_of_storage_error(e, error_text):
                     print(f"[FATAL] out of storage while downloading {clip_json_path}: {e}")
                     return f"{NOSPACE_MARKER}: {error_text}"
