@@ -8,6 +8,7 @@ from io import StringIO
 import json
 import argparse
 from functools import partial
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import hashlib
@@ -77,6 +78,48 @@ def normalize_proxy_url(proxy):
         return f'socks5://127.0.0.1:{proxy}/'
 
     return f'http://{proxy}'
+
+
+PROXY_ENV_VARS = (
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+)
+NO_PROXY_ENV_VARS = (
+    "NO_PROXY",
+    "no_proxy",
+)
+
+
+@contextmanager
+def scoped_proxy_environment(proxy_url):
+    """Make subprocess proxy selection match yt-dlp's proxy for this worker call.
+
+    yt-dlp passes HTTP_PROXY/http_proxy to ffmpeg, but it preserves any existing
+    HTTPS_PROXY/ALL_PROXY/NO_PROXY values from the parent environment. For YouTube
+    media URLs bound to the proxy's public IP, stale HTTPS proxy settings can make
+    ffmpeg fetch googlevideo URLs through a different route and receive 403.
+    """
+    if not proxy_url:
+        yield
+        return
+
+    old_env = {name: os.environ.get(name) for name in PROXY_ENV_VARS + NO_PROXY_ENV_VARS}
+    try:
+        for name in PROXY_ENV_VARS:
+            os.environ[name] = proxy_url
+        for name in NO_PROXY_ENV_VARS:
+            os.environ.pop(name, None)
+        yield
+    finally:
+        for name, value in old_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 # --------------------------------------------------------------------------------------------------
@@ -710,8 +753,8 @@ def download_yt_video(entry,
                 ydl_opts['postprocessors'] = [{'key': 'FFmpegVideoConvertor',
                                                 'preferedformat': 'mp4',  # Ensure the output is MP4
                                                 }]
-            if proxy is not None:
-                proxy_url = normalize_proxy_url(proxy)
+            proxy_url = normalize_proxy_url(proxy)
+            if proxy_url is not None:
                 ydl_opts['proxy'] = proxy_url
                 parsed_proxy = urlparse(proxy_url)
                 if parsed_proxy.scheme.lower() in ("http", "https"):
@@ -729,40 +772,41 @@ def download_yt_video(entry,
                 wait_for_global_download_slot(rate_state=rate_state,
                                               rate_lock=rate_lock,
                                               max_videos_per_hour=max_videos_per_hour)
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    file_exist = os.path.isfile(os.path.join(outpath, f'{video_id}_{file_idx:03d}.{out_file_ext}'))
-                    info=ydl.extract_info(url, download=not file_exist)
-                    filename = f'{video_id}_{file_idx:03d}.{out_file_ext}'
-                    jsonname = f'{video_id}_{file_idx:03d}.json'
-                    if not file_exist:
-                        shutil.move(os.path.join(temp_clip_dir, f'audio.{out_file_ext}'), os.path.join(outpath, filename))
-                    else:
-                        pass
-                    file_meta = {'id':f'{video_id}','path': os.path.join(outpath, filename),'title': info['title'], 'url':url, 'start': start, 'end': to}
+                with scoped_proxy_environment(proxy_url):
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        file_exist = os.path.isfile(os.path.join(outpath, f'{video_id}_{file_idx:03d}.{out_file_ext}'))
+                        info=ydl.extract_info(url, download=not file_exist)
+                        filename = f'{video_id}_{file_idx:03d}.{out_file_ext}'
+                        jsonname = f'{video_id}_{file_idx:03d}.json'
+                        if not file_exist:
+                            shutil.move(os.path.join(temp_clip_dir, f'audio.{out_file_ext}'), os.path.join(outpath, filename))
+                        else:
+                            pass
+                        file_meta = {'id':f'{video_id}','path': os.path.join(outpath, filename),'title': info['title'], 'url':url, 'start': start, 'end': to}
 
-                    if autocap_caption is not None:
-                        file_meta['autocap_caption'] = autocap_caption
+                        if autocap_caption is not None:
+                            file_meta['autocap_caption'] = autocap_caption
 
-                    # meta data
-                    file_meta['resolution'] = info.get('resolution')
-                    file_meta['fps'] = info.get('fps')
-                    file_meta['aspect_ratio'] = info.get('aspect_ratio')
-                    file_meta['audio_channels'] = info.get('audio_channels')
+                        # meta data
+                        file_meta['resolution'] = info.get('resolution')
+                        file_meta['fps'] = info.get('fps')
+                        file_meta['aspect_ratio'] = info.get('aspect_ratio')
+                        file_meta['audio_channels'] = info.get('audio_channels')
 
-                    file_meta['description'] = info.get('description')
-                    file_meta['uploader'] = info.get('uploader')
-                    file_meta['upload_date'] = info.get('upload_date')
-                    file_meta['duration'] = info.get('duration')
-                    file_meta['view_count'] = info.get('view_count')
-                    file_meta['like_count'] = info.get('like_count')
-                    file_meta['channel_follower_count'] = info.get('channel_follower_count')
-                    file_meta['dislike_count'] = info.get('dislike_count')
-                    file_meta['channel_id'] = info.get('channel_id')
-                    file_meta['channel_url'] = info.get('channel_url')
-                    file_meta['channel_name'] = info.get('uploader')
+                        file_meta['description'] = info.get('description')
+                        file_meta['uploader'] = info.get('uploader')
+                        file_meta['upload_date'] = info.get('upload_date')
+                        file_meta['duration'] = info.get('duration')
+                        file_meta['view_count'] = info.get('view_count')
+                        file_meta['like_count'] = info.get('like_count')
+                        file_meta['channel_follower_count'] = info.get('channel_follower_count')
+                        file_meta['dislike_count'] = info.get('dislike_count')
+                        file_meta['channel_id'] = info.get('channel_id')
+                        file_meta['channel_url'] = info.get('channel_url')
+                        file_meta['channel_name'] = info.get('uploader')
 
-                    print("[INFO] save meta data for", os.path.join(outpath, jsonname))
-                    write_json_file(os.path.join(outpath, jsonname), file_meta)
+                        print("[INFO] save meta data for", os.path.join(outpath, jsonname))
+                        write_json_file(os.path.join(outpath, jsonname), file_meta)
                 shutil.rmtree(temp_clip_dir, ignore_errors=True)
             except Exception as e:
                 shutil.rmtree(temp_clip_dir, ignore_errors=True)
@@ -809,7 +853,7 @@ def download_yt_video(entry,
                     print(f"[ERROR] marked video {video_id} as permanently failed at {video_error_path}: {e}")
                 else:
                     print(f"[ERROR] downloading {clip_json_path}:", e)
-                return error_text
+                raise e
             finally:
                 ytdl_logger.removeHandler(log_handler)
                 log_handler.close()
@@ -1027,7 +1071,7 @@ def download_audioset_split(json_file,
     if tigris_endpoint is None:
         tigris_endpoint = _env("AWS_ENDPOINT_URL", "TIGRIS_ENDPOINT_URL")
 
-    num_processes = num_processes or os.cpu_count() or 1
+    num_processes = max(1, int(num_processes or os.cpu_count() or 1))
     tigris_upload_workers = max(1, int(tigris_upload_workers or 1))
     if reorganize_local and range_selector_is_used(start_idx, end_idx, subset, subset_start, subset_end):
         raise ValueError("--reorganize_local scans all local subset folders and can delete files "
