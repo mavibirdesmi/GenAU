@@ -1203,8 +1203,11 @@ def download_audioset_split(json_file,
                             continue  # restart this subset from the beginning (resume skips done clips)
 
                         if transient_remaining:
+                            failed_video_ids = [entry_by_idx[vi][1][0] for vi in failed_idxs]
                             print(f"[ERROR] subset {subset_name} still has transient errors after "
                                   f"{max_retry_rounds} probe round(s). Stopping.")
+                            print(f"[ERROR] subset {subset_name}: could not retrieve the following video id(s) "
+                                  f"after {max_retry_rounds} probe round(s): {', '.join(failed_video_ids)}")
                             _write_logs(all_logs, subset_log_path)
                             return
                         break  # subset download complete, proceed to sha256 + upload
