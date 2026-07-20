@@ -47,7 +47,7 @@ PERMANENT_VIDEO_ERROR_PATTERNS = (
     "this live event will begin in",
     "this live event has ended",
     "members-only content",
-    "We're processing this video"
+    "we're processing this video"
 )
 
 
