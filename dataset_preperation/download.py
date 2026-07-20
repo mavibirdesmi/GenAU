@@ -20,7 +20,7 @@ from botocore.config import Config
 from dotenv import load_dotenv
 from download_manager import get_dataset_json_file, dataset_urls
 
-RATE_LIMIT_COOLDOWN_SECONDS = 5 * 60
+RATE_LIMIT_COOLDOWN_SECONDS = 60 * 60
 RATE_LIMIT_ERROR_PATTERNS = (
     "rate limit",
     "too many requests",
@@ -47,6 +47,7 @@ PERMANENT_VIDEO_ERROR_PATTERNS = (
     "this live event will begin in",
     "this live event has ended",
     "members-only content",
+    "We're processing this video"
 )
 
 
