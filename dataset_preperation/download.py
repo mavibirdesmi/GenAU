@@ -1001,6 +1001,7 @@ def download_audioset_split(json_file,
                             clap_threshold=0.4,
                             min_audio_len=4,
                             max_videos_per_hour=1700.0,
+                            max_concurrent_downloads=2,
                             sleep_interval=10.0,
                             sleep_interval_subtitles=5.0,
                             sleep_interval_requests=0.75,
@@ -1113,7 +1114,7 @@ def download_audioset_split(json_file,
                                        max_sleep_interval=max_sleep_interval)
 
         all_logs = []
-        pool = ctx.Pool(num_processes * 2, initializer=_init_pool_worker,
+        pool = ctx.Pool(max_concurrent_downloads, initializer=_init_pool_worker,
                         initargs=(download_audio_split,))
         try:
             with tqdm(total=len(all_entries), desc="videos", unit="video") as pbar:
@@ -1198,7 +1199,7 @@ def download_audioset_split(json_file,
                             clean_temp_dir(temp_working_dir)
                             pool.terminate()
                             pool.join()
-                            pool = ctx.Pool(num_processes * 2, initializer=_init_pool_worker,
+                            pool = ctx.Pool(max_concurrent_downloads, initializer=_init_pool_worker,
                                             initargs=(download_audio_split,))
                             continue  # restart this subset from the beginning (resume skips done clips)
 
@@ -1364,7 +1365,13 @@ if __name__ == "__main__":
                         help="redownload already downloaded files")
 
     parser.add_argument('--num_processes', type=int, default=os.cpu_count(),
-                        help="number of processes to use for downloading, default is set to the number of CPU cores")
+                        help="(Deprecated) Previously controlled the worker pool size. Use --max_concurrent_downloads instead.")
+
+    parser.add_argument("--max_concurrent_downloads",
+                        type=int,
+                        default=2,
+                        help="Maximum number of worker processes concurrently running yt-dlp downloads. "
+                             "Lower values reduce YouTube rate-limit/429 risk by avoiding bursty concurrent requests. Default: 2")
 
     parser.add_argument("--max_videos_per_hour",
                         type=float,
@@ -1480,6 +1487,7 @@ if __name__ == "__main__":
                                 resume=not args.redownload,
                                 files_per_folder=args.files_per_folder,
                                 num_processes=args.num_processes,
+                                max_concurrent_downloads=args.max_concurrent_downloads,
                                 upload_to_tigris=not args.skip_tigris_upload,
                                 tigris_bucket=args.tigris_bucket,
                                 tigris_manifest_bucket=args.tigris_manifest_bucket,
