@@ -593,6 +593,23 @@ def build_video_error_path(outpath, video_id):
     return os.path.join(outpath, f"{video_id}.error.json")
 
 
+def is_video_marked_permanently_failed(save_dir, files_per_folder, video_idx, video_id):
+    """Check the on-disk .error.json marker directly instead of re-classifying the noisy
+    returned error text a second time.
+
+    download_yt_video already makes the authoritative permanent-vs-transient decision (based on
+    yt-dlp's final exception message) and writes the marker file when a video is permanently
+    unavailable. Re-running text-based classification on the full returned error string (which
+    includes the whole verbose log) here would risk the same false-negative this file exists to
+    avoid: an incidental "429"/"too many requests" substring earlier in the log can make a
+    genuinely permanent failure look transient. Trusting the marker file is a single source of
+    truth and avoids that entirely.
+    """
+    subfolder_idx = f'{video_idx // files_per_folder:06}'
+    outpath = os.path.join(save_dir, subfolder_idx)
+    return os.path.isfile(build_video_error_path(outpath, video_id))
+
+
 def register_rate_limit_cooldown(rate_state, rate_lock, cooldown_seconds=RATE_LIMIT_COOLDOWN_SECONDS):
     if rate_state is None or rate_lock is None:
         return
@@ -796,14 +813,17 @@ def download_yt_video(entry,
                 if is_out_of_storage_error(e, error_text):
                     print(f"[FATAL] out of storage while downloading {clip_json_path}: {e}")
                     return f"{NOSPACE_MARKER}: {error_text}"
-                if is_rate_limit_error(error_text):
-                    register_rate_limit_cooldown(rate_state=rate_state,
-                                                 rate_lock=rate_lock,
-                                                 cooldown_seconds=RATE_LIMIT_COOLDOWN_SECONDS)
-                    print(f"[ERROR] rate limited while downloading {clip_json_path}: {e}")
-                    return error_text
 
-                if is_permanent_video_error(error_text):
+                # Classify using yt-dlp's FINAL exception message first, not the full verbose
+                # log. yt-dlp often tries several fallback clients before giving up (e.g. a
+                # webpage fetch may hit a transient HTTP 429 while an earlier/unrelated attempt
+                # succeeds or a later attempt fails for a different, permanent reason). The full
+                # log can therefore contain "429"/"too many requests" text from a non-fatal,
+                # intermediate step even when the actual final verdict is a permanent error like
+                # "Video unavailable". Checking str(e) avoids misclassifying those cases as
+                # rate-limited (and endlessly retrying videos that are genuinely unavailable).
+                final_error_text = str(e)
+                if is_permanent_video_error(final_error_text):
                     error_meta = {
                         "id": video_id,
                         "url": url,
@@ -817,8 +837,16 @@ def download_yt_video(entry,
                     }
                     write_json_file(video_error_path, error_meta)
                     print(f"[ERROR] marked video {video_id} as permanently failed at {video_error_path}: {e}")
-                else:
-                    print(f"[ERROR] downloading {clip_json_path}:", e)
+                    return error_text
+
+                if is_rate_limit_error(error_text):
+                    register_rate_limit_cooldown(rate_state=rate_state,
+                                                 rate_lock=rate_lock,
+                                                 cooldown_seconds=RATE_LIMIT_COOLDOWN_SECONDS)
+                    print(f"[ERROR] rate limited while downloading {clip_json_path}: {e}")
+                    return error_text
+
+                print(f"[ERROR] downloading {clip_json_path}:", e)
                 return error_text
             finally:
                 ytdl_logger.removeHandler(log_handler)
@@ -1186,8 +1214,12 @@ def download_audioset_split(json_file,
                                 if result is not None and not result.startswith(NOSPACE_MARKER):
                                     all_logs.append(result)
 
-                            failed_idxs = [vi for vi, result in results
-                                          if result is not None and not is_permanent_video_error(result)]
+                            failed_idxs = [
+                                vi for vi, result in results
+                                if result is not None
+                                and not is_video_marked_permanently_failed(
+                                    save_dir, files_per_folder, vi, entry_by_idx[vi][1][0])
+                            ]
                             if not failed_idxs:
                                 transient_remaining = False
                                 break
