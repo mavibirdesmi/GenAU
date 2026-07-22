@@ -19,6 +19,7 @@ import boto3
 from botocore.config import Config
 from dotenv import load_dotenv
 from download_manager import get_dataset_json_file, dataset_urls
+from rate_limit_manager import YoutubeVideoRateLimitManager  # noqa: F401 (registers the manager proxy type on import)
 
 RATE_LIMIT_COOLDOWN_SECONDS = 60 * 60
 RATE_LIMIT_ERROR_PATTERNS = (
@@ -599,31 +600,37 @@ def register_rate_limit_cooldown(rate_state, rate_lock, cooldown_seconds=RATE_LI
     with rate_lock:
         cooldown_until_ts = time.monotonic() + cooldown_seconds
         rate_state["cooldown_until_ts"] = max(rate_state.get("cooldown_until_ts", 0.0), cooldown_until_ts)
-        rate_state["next_allowed_ts"] = max(rate_state.get("next_allowed_ts", 0.0), rate_state["cooldown_until_ts"])
 
 
-def wait_for_global_download_slot(rate_state, rate_lock, max_videos_per_hour):
-    if rate_state is None or rate_lock is None or max_videos_per_hour <= 0:
-        return
+def wait_for_global_download_slot(rate_state, rate_lock, rate_limiter):
+    """Block until it is safe to start a new download.
 
-    min_interval_seconds = 3600.0 / float(max_videos_per_hour)
-    while True:
-        with rate_lock:
-            now = time.monotonic()
-            next_allowed_ts = rate_state.get("next_allowed_ts", 0.0)
-            cooldown_until_ts = rate_state.get("cooldown_until_ts", 0.0)
-            wait_time = max(next_allowed_ts, cooldown_until_ts) - now
-            if wait_time <= 0:
-                rate_state["next_allowed_ts"] = now + min_interval_seconds
-                return
-        time.sleep(min(wait_time, 0.25))
+    Two independent gates are enforced:
+      1. A hard cooldown after a detected YouTube rate-limit (429) response, tracked in the
+         shared `rate_state`/`rate_lock` (see register_rate_limit_cooldown).
+      2. A rolling one-hour download budget enforced by `rate_limiter`, a
+         YoutubeVideoRateLimitManager proxy shared across all worker processes, which tracks
+         actual usage timestamps instead of assuming a fixed average interval.
+    """
+    if rate_state is not None and rate_lock is not None:
+        while True:
+            with rate_lock:
+                wait_time = rate_state.get("cooldown_until_ts", 0.0) - time.monotonic()
+                if wait_time <= 0:
+                    break
+            time.sleep(min(wait_time, 1.0))
+
+    if rate_limiter is not None:
+        while not rate_limiter.try_consume():
+            time.sleep(0.5)
+
 
 def download_yt_video(entry,
                     save_dir,
                     temp_working_dir,
                     rate_state=None,
                     rate_lock=None,
-                    max_videos_per_hour=1700.0,
+                    rate_limiter=None,
                     yt_cookie_path=None,
                     audio_only=False,
                     proxy=None,
@@ -688,6 +695,7 @@ def download_yt_video(entry,
                 'external_downloader':'ffmpeg',
                 'download_ranges': yt_dlp.utils.download_range_func([], [[start, to]]),
                 'force_keyframe_at_cuts': True,
+                'socket_timeout': 30,
                 'external_downloader_args': {
                     'ffmpeg': ['-loglevel', 'error'],
                 },
@@ -729,7 +737,7 @@ def download_yt_video(entry,
             try:
                 wait_for_global_download_slot(rate_state=rate_state,
                                               rate_lock=rate_lock,
-                                              max_videos_per_hour=max_videos_per_hour)
+                                              rate_limiter=rate_limiter)
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     file_exist = os.path.isfile(os.path.join(outpath, f'{video_id}_{file_idx:03d}.{out_file_ext}'))
                     info=ydl.extract_info(url, download=not file_exist)
@@ -1092,16 +1100,21 @@ def download_audioset_split(json_file,
     ctx = get_context("spawn")
     with ctx.Manager() as manager:
         rate_state = manager.dict()
-        rate_state["next_allowed_ts"] = 0.0
         rate_state["cooldown_until_ts"] = 0.0
         rate_lock = manager.Lock()
+
+        # Sliding one-hour download budget, shared across all worker processes. See
+        # YoutubeVideoRateLimitManager for why this replaces the old fixed-interval calculation.
+        rate_limiter = None
+        if max_videos_per_hour and max_videos_per_hour > 0:
+            rate_limiter = manager.YoutubeVideoRateLimitManager(int(max_videos_per_hour))
 
         download_audio_split = partial(download_yt_video,
                                        save_dir=save_dir,
                                        temp_working_dir=temp_working_dir,
                                        rate_state=rate_state,
                                        rate_lock=rate_lock,
-                                       max_videos_per_hour=max_videos_per_hour,
+                                       rate_limiter=rate_limiter,
                                        yt_cookie_path=yt_cookie_path,
                                        audio_only=audio_only,
                                        proxy=proxy_port,
@@ -1376,7 +1389,10 @@ if __name__ == "__main__":
     parser.add_argument("--max_videos_per_hour",
                         type=float,
                         default=1700.0,
-                        help="Global cap on started video downloads across all workers")
+                        help="Global rolling one-hour cap on started clip downloads across all workers, "
+                             "enforced via a sliding time window over actual usage timestamps "
+                             "(YoutubeVideoRateLimitManager), not a fixed average-interval approximation. "
+                             "Videos with multiple clips can consume multiple slots.")
 
     parser.add_argument("--sleep_interval",
                         type=float,
